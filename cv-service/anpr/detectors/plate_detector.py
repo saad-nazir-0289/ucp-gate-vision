@@ -27,6 +27,8 @@ class YoloPlateDetector(PlateDetector):
         frame_edge_margin_px: int = 2,
         min_plate_width_px: int = 24,
         min_plate_height_px: int = 10,
+        min_aspect_ratio: float = 1.0,
+        max_aspect_ratio: float = 3.0,
     ):
         logger.info("Loading plate detector weights=%s device=%s", weights_path, device)
         self.model = YOLO(weights_path)
@@ -55,6 +57,16 @@ class YoloPlateDetector(PlateDetector):
         # if your camera setup legitimately produces smaller legible plates.
         self.min_plate_width_px = min_plate_width_px
         self.min_plate_height_px = min_plate_height_px
+        # Real plates are a fairly consistent width:height ratio; non-plate
+        # rectangular text (signage, banners) often isn't. Confirmed on real
+        # footage: every genuine plate box measured so far has ratio ~1.4-1.9
+        # (e.g. AAL988 1.54, BUV711 1.86, a motorcycle plate 1.72-1.55), while
+        # a false positive on an "Entrance" sign — correctly boxed and
+        # correctly OCR'd as text, just not a plate — measured 4.47 (259x58px).
+        # Defaults leave generous headroom above/below the observed real
+        # range rather than tightly fitting it, since this is a small sample.
+        self.min_aspect_ratio = min_aspect_ratio
+        self.max_aspect_ratio = max_aspect_ratio
 
     def detect(self, frame: np.ndarray, vehicle_box: BBox) -> list[Detection]:
         frame_h, frame_w = frame.shape[:2]
@@ -99,6 +111,15 @@ class YoloPlateDetector(PlateDetector):
                 logger.debug(
                     "Skipping plate detection too small to be legible: %.0fx%.0fpx (min %dx%dpx)",
                     box_w, box_h, self.min_plate_width_px, self.min_plate_height_px,
+                )
+                continue
+
+            aspect_ratio = box_w / box_h if box_h > 0 else float("inf")
+            if not (self.min_aspect_ratio <= aspect_ratio <= self.max_aspect_ratio):
+                logger.debug(
+                    "Skipping plate detection with non-plate aspect ratio: %.0fx%.0fpx ratio=%.2f "
+                    "(allowed %.1f-%.1f)",
+                    box_w, box_h, aspect_ratio, self.min_aspect_ratio, self.max_aspect_ratio,
                 )
                 continue
 

@@ -51,10 +51,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Local path to plate-detector weights — see scripts/download_plate_model.py",
     )
     p.add_argument("--device", default="cpu", help="'cpu', 'cuda:0', etc.")
+    p.add_argument(
+        "--tracker",
+        default="bytetrack.yaml",
+        help="Ultralytics tracker config name, e.g. 'bytetrack.yaml' (default, fast) or "
+        "'botsort.yaml' (adds appearance-based ReID — more robust across occlusion/gaps, more compute)",
+    )
     p.add_argument("--frame-skip", type=int, default=1, help="Process every Nth frame (1 = every frame)")
     p.add_argument("--vehicle-conf", type=float, default=0.35)
     p.add_argument("--plate-conf", type=float, default=0.25)
-    p.add_argument("--ocr-min-conf", type=float, default=0.30)
+    p.add_argument(
+        "--ocr-min-conf",
+        type=float,
+        default=0.95,
+        help="Confirmed on real footage: 0.95 cleanly drops garbage reads from low-quality "
+        "track fragments while every genuine plate read still clears it (0.96-0.9997 on the "
+        "winning frame). Trade-off: a genuine plate that never gets a clear enough frame is "
+        "silently dropped instead of flagged low-confidence — watch for this on harder footage.",
+    )
     p.add_argument("--log-level", default="INFO")
     return p
 
@@ -76,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
         weights=args.vehicle_weights,
         device=args.device,
         conf_threshold=args.vehicle_conf,
+        tracker_cfg=args.tracker,
     )
 
     log.info("Loading plate detector (%s) ...", args.plate_weights)

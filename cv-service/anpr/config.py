@@ -29,7 +29,16 @@ class PipelineConfig:
     plate_iou: float = 0.45
     plate_margin_ratio: float = 0.15  # crop margin around the vehicle box, as a fraction of box size
 
-    ocr_min_confidence: float = 0.30
+    # Confirmed on real footage: 0.95 cleanly suppressed a garbage OCR read
+    # from a split-track fragment (a distant/low-quality crop of a car whose
+    # plate was correctly read on a later, better fragment) while every
+    # genuine plate read in testing still cleared it comfortably (0.96-0.9997
+    # on the winning frame). Trade-off: a genuine plate that never gets a
+    # close/clear enough frame to cross 0.95 is now silently dropped rather
+    # than logged as a low-confidence flag for review (FR-5.4 wants the
+    # latter) — worth watching on harder footage (motorbikes, low light) and
+    # dialing back per-gate if it starts suppressing real reads.
+    ocr_min_confidence: float = 0.95
     ocr_lang: str = "en"
 
     track_max_age_frames: int = 30
