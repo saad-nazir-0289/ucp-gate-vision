@@ -1,0 +1,21 @@
+# Pinned as of writing (Aug 2026). Bump deliberately, not via a casual
+# `pip install -U` — see cv-service/README.md "Known risks":
+#   - PaddleOCR's Python API changed materially between the 2.x and 3.x
+#     lines; this pins 3.x and anpr/ocr/paddle_ocr.py targets that API.
+#   - ultralyticsplus (a convenience loader for keremberke/* HF models) was
+#     tried and dropped: 0.1.0 hard-pins ultralytics<8.1.0, which conflicts
+#     with the ultralytics version below that the core pipeline needs.
+#     scripts/download_plate_model.py uses huggingface_hub directly instead.
+#   - Requires Python 3.10 or 3.11 — paddlepaddle==3.2.0 has no published
+#     wheel for 3.12+ (or 3.14) as of writing; `py -0p` to check what's
+#     installed, `py -3.10 -m venv .venv` to target a specific one.
+
+ultralytics==8.4.53          # VehicleDetector (YOLOv8/COCO) + PlateDetector (custom weights) + ByteTrack via .track()
+opencv-python==4.10.0.84     # video I/O, frame drawing/annotation
+numpy==1.26.4
+
+paddleocr==3.7.0             # PlateOCR (primary implementation)
+paddlepaddle==3.2.0          # PaddleOCR's backend — CPU build. Swap for
+                              # paddlepaddle-gpu==3.2.0 (+ matching CUDA toolkit) if a GPU is available.
+
+huggingface_hub==0.24.6      # scripts/download_plate_model.py

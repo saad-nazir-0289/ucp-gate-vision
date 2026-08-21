@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# generated at runtime
+output/*
+!output/README.md
+
+# local model weights / test videos — see models/README.md, sample_data/README.md
+models/*.pt
+!models/README.md
+sample_data/*
+!sample_data/README.md
+*.mp4
+*.avi
+
+runs/
+.cache/
