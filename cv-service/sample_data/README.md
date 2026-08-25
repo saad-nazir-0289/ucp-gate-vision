@@ -19,3 +19,9 @@ Dataset is sent on whatsapp group (Vision Project) file_name data_set.zip. It co
     dataset_night_01.mp4
     dataset_multiple_vehicles_01.mp4
     dataset_multiple_vehicles_02.mp4
+
+At 30 seconds a new bike appears at the end of entring, this issue came  when we combine multiple short videos. We can take a look how model behaves at this moment. 
+A rikshaw appears in the footage from 112 to 119 coming out.
+A bike appears in and then disappears at 2:18(138) from in side.
+A bike suddenly appears in fram at 2:23(143)
+A car suddenly appears and disappears at 2:48(168)

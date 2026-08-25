@@ -1,24 +1,31 @@
 filename,timestamp_sec,vehicle_type,plate,condition,notes
-dataset_clear_01.mp4,8,car,55,clear
-dataset_clear_01.mp4,20,car,MNW 6860,clear
-dataset_clear_01.mp4,23,bike,undefined,clear
-dataset_clear_01.mp4,30,bike,undefined,clear,going in/number plate is hidden by wire lock
-dataset_clear_01.mp4,35,bike,undefined,clear
-dataset_clear_01.mp4,49,car,ANY 626,clear
-dataset_clear_01.mp4,66,car,AWX 614,clear
-dataset_clear_01.mp4,79,car,AJA 025,clear
-dataset_dusk_01.mp4,10,car,undefined,dusk,blurry view and cars light might be bluring the view
-dataset_dusk_01.mp4,24,car,undefined,dusk,blurry view and cars light might be bluring the view
-dataset_dusk_01.mp4,38,car,undefined,dusk
-dataset_dusk_01.mp4,40,bike,undefined,dusk, blurry view
-dataset_dusk_01.mp4,56,car,undefined,dusk
-dataset_dusk_01.mp4,61,car,undefined,dusk
-dataset_dusk_01.mp4,80,car,undefined,dusk
-dataset_dusk_01.mp4,90,car,undefined,dusk
-dataset_night_01.mp4,12,car,undefined,night
-dataset_night_01.mp4,23,car,undefined,night
-dataset_night_01.mp4,32,car,undefined,night
-dataset_night_01.mp4,36,car,undefined,night
+dataset_clear_01.mp4,3,BIKE,AFA 6610,CLEAR
+dataset_clear_01.mp4,11,BIKE,LEM2025,CLEAR
+dataset_clear_01.mp4,14,BIKE,LEQ3288,clear
+dataset_clear_01.mp4,20,CAR,AWJ431,CLEAR
+dataset_clear_01.mp4,25,CAR,LEC3799,CLEAR
+dataset_clear_01.mp4,30,BIKE,AYJ2527,CLEAR
+dataset_clear_01.mp4,35,BIKE,LEN9009,CLEAR
+dataset_clear_01.mp4,43,CAR,AUT094,CLEAR
+dataset_clear_01.mp4,46,CAR,LEE369,CLEAR
+dataset_clear_01.mp4,47,CAR,AZE335,CLEAR
+dataset_clear_01.mp4,48,CAR,AXP625,CLEAR, going in
+dataset_clear_01.mp4,60,CAR,AXP625,CLEAR,coming out
+dataset_clear_01.mp4,66,CAR,LEE8980,CLEAR
+dataset_clear_01.mp4,84,CAR,ASJ765,CLEAR
+dataset_clear_01.mp4,91,CAR,BEW278,CLEAR
+dataset_clear_01.mp4,101,CAR,LEH1896,CLEAR
+dataset_clear_01.mp4,106,CAR,AED186,CLEAR
+dataset_clear_01.mp4,120,CAR,LEE2271,CLEAR
+dataset_clear_01.mp4,132,BIKE,BHX5441,CLEAR
+dataset_clear_01.mp4,137,BIKE,BAG9976,CLEAR
+dataset_clear_01.mp4,139,BIKE,LEN910,CLEAR
+dataset_clear_01.mp4,147,BIKE,LRK4645,CLEAR
+dataset_clear_01.mp4,151,BIKE,BHC4461,CLEAR
+dataset_clear_01.mp4,156,CAR,LED277,CLEAR
+dataset_clear_01.mp4,174,CAR,BPG516,CLEAR
+dataset_clear_01.mp4,180,CAR,AAR356,CLEAR
+
 dataset_multiple_vehicles_01.mp4,6,car,AZF 441,day Multiple vehicles
 dataset_multiple_vehicles_01.mp4,6,bike,LEM 5133,day Multiple vehicles
 dataset_multiple_vehicles_02.mp4,6,bike,APM 7367,day  Multiple vehicles
