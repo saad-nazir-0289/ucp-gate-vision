@@ -19,9 +19,10 @@ dataset_night_01.mp4,12,car,undefined,night
 dataset_night_01.mp4,23,car,undefined,night
 dataset_night_01.mp4,32,car,undefined,night
 dataset_night_01.mp4,36,car,undefined,night
-dataset_multiple_vehicles_01.mp4,6,car, AZF 441,day Multiple vehicles
+dataset_multiple_vehicles_01.mp4,6,car,AZF 441,day Multiple vehicles
+dataset_multiple_vehicles_01.mp4,6,bike,LEM 5133,day Multiple vehicles
 dataset_multiple_vehicles_02.mp4,6,bike,APM 7367,day  Multiple vehicles
 dataset_multiple_vehicles_02.mp4,6,bike,LEX 127,day  Multiple vehicles
-dataset_multiple_vehicles_02.mp4,9,car,BKV 306, day  Multiple vehicles
-dataset_multiple_vehicles_02.mp4,9,bike,LER 7662, day  Multiple vehicles
-dataset_multiple_vehicles_02.mp4,6,car,ABA 196, day  Multiple vehicles
+dataset_multiple_vehicles_02.mp4,9,car,BKV 306,day  Multiple vehicles
+dataset_multiple_vehicles_02.mp4,9,bike,LER 7662,day  Multiple vehicles
+dataset_multiple_vehicles_02.mp4,6,car,ABA 196,day  Multiple vehicles
