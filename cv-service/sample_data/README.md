@@ -15,11 +15,8 @@ Each undefined value means, number plate wasn't readable from humen eye.
 rainy data isn't available
 Dataset is sent on whatsapp group (Vision Project) file_name data_set.zip. It contains these file
     dataset_clear_01.mp4
-    dataset_dusk_01.mp4
-    dataset_night_01.mp4
-    dataset_multiple_vehicles_01.mp4
-    dataset_multiple_vehicles_02.mp4
 
+## Some issue in the dataset_clear_01.mp4
 At 30 seconds a new bike appears at the end of entring, this issue came  when we combine multiple short videos. We can take a look how model behaves at this moment. 
 A rikshaw appears in the footage from 112 to 119 coming out.
 A bike appears in and then disappears at 2:18(138) from in side.
