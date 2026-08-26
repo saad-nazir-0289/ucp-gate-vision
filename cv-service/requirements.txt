@@ -19,3 +19,6 @@ paddlepaddle==3.2.0          # PaddleOCR's backend — CPU build. Swap for
                               # paddlepaddle-gpu==3.2.0 (+ matching CUDA toolkit) if a GPU is available.
 
 huggingface_hub==0.24.6      # scripts/download_plate_model.py
+scipy==1.15.3                 # scripts/score_accuracy.py — exact bipartite matching via linear_sum_assignment
+                              # (already installed transitively via paddlex; declared explicitly here rather
+                              # than relying on that, same reasoning that got pandas removed from this file)

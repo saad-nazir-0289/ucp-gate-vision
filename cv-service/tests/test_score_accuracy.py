@@ -100,6 +100,25 @@ class TestMatchEventsToGroundTruth(unittest.TestCase):
         self.assertTrue(gt_rows[0].ambiguous, "two candidates competed for one GT row — this is genuine contention")
         self.assertEqual(events[assignments[0]].plate, "AAA111", "closest candidate should still win")
 
+    def test_ambiguous_flag_fires_on_one_event_contested_by_two_gt_rows(self):
+        """FIX #9: the mirror case the one-sided check missed. GT_A and
+        GT_B are each other's ONLY candidate event (both see exactly 1
+        option, so the old GT-side-only count would never flag either) —
+        but that one event is a candidate for BOTH of them, so whichever
+        wins it is still a guess."""
+        gt_rows = [
+            GroundTruthRow(index=0, filename="c.mp4", timestamp_sec=50.0, vehicle_type="car", plate="AAA111", condition="day", notes=""),
+            GroundTruthRow(index=1, filename="c.mp4", timestamp_sec=50.3, vehicle_type="car", plate="BBB222", condition="day", notes=""),
+        ]
+        events = [
+            PipelineEvent(index=0, filename="c.mp4", timestamp_sec=50.1, vehicle_type="car", plate="AAA111", track_id=1),
+        ]
+
+        match_events_to_ground_truth(gt_rows, events, time_window=5.0)
+
+        self.assertTrue(gt_rows[0].ambiguous, "only 1 candidate from A's own view, but that event was contested by B too")
+        self.assertTrue(gt_rows[1].ambiguous)
+
     def test_greedy_would_fail_this_case_exact_matching_must_not(self):
         """Concrete counterexample (FIX #7): GT_A's only candidate is also
         GT_B's closest (but not only) candidate. Global closest-distance-
@@ -126,6 +145,25 @@ class TestMatchEventsToGroundTruth(unittest.TestCase):
         self.assertEqual(len(assignments), 2, "both GT rows must be matched — greedy would leave GT_A ('Missed') with only 1 match total")
         self.assertEqual(events[assignments[0]].track_id, 1, "GT_A must get its only candidate, E1")
         self.assertEqual(events[assignments[1]].track_id, 2, "GT_B must get its remaining option, E2")
+
+    def test_large_cluster_still_achieves_maximum_cardinality(self):
+        """The specific bug reported: the old backtracking implementation
+        fell back to broken greedy above 8 GT rows in one cluster. This
+        tiles the same steal-pattern counterexample 10x (20 GT rows total,
+        all in one contested cluster) — every pair must still fully match;
+        the old size-limited fallback would have dropped some to "Missed"."""
+        gt_rows = []
+        events = []
+        for k in range(10):
+            base = k * 100.0  # spaced far apart so pairs don't cross-contest each other
+            gt_rows.append(GroundTruthRow(index=2 * k, filename="c.mp4", timestamp_sec=base, vehicle_type="car", plate=f"A{k}", condition="clear", notes=""))
+            gt_rows.append(GroundTruthRow(index=2 * k + 1, filename="c.mp4", timestamp_sec=base + 0.3, vehicle_type="car", plate=f"B{k}", condition="clear", notes=""))
+            events.append(PipelineEvent(index=2 * k, filename="c.mp4", timestamp_sec=base + 0.25, vehicle_type="car", plate=f"A{k}", track_id=2 * k))
+            events.append(PipelineEvent(index=2 * k + 1, filename="c.mp4", timestamp_sec=base + 1.0, vehicle_type="car", plate=f"B{k}", track_id=2 * k + 1))
+
+        assignments = match_events_to_ground_truth(gt_rows, events, time_window=0.9)
+
+        self.assertEqual(len(assignments), 20, "all 20 ground-truth rows must match — none dropped to a false 'Missed'")
 
 
 class TestFindDuplicateEvents(unittest.TestCase):

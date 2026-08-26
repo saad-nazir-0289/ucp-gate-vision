@@ -11,7 +11,10 @@ are fixed:
 
 1. **Undeclared dependency.** It used `pandas`, which isn't in
    requirements.txt and only worked because paddlex happens to pull it in
-   transitively. This script uses only the standard library.
+   transitively. This script otherwise uses only the standard library, plus
+   one deliberate, explicitly-declared dependency added later (`scipy`,
+   for exact bipartite matching — see fix #7) rather than another
+   accidental transitive one.
 
 2. **Vehicle-type normalization didn't fold truck/bus into car.** Confirmed
    by testing (see cv-service/README.md "Known risks"): the generic
@@ -56,12 +59,33 @@ Two more issues found in a follow-up review of this file specifically
    also row B's *closest* (but not only) candidate, greedy grabs that event
    for B first, leaving A unmatched ("Missed") even though assigning A its
    sole option and B its second-best would have matched both. See
-   `_best_assignment_for_component` and
    `tests/test_score_accuracy.py::test_greedy_would_fail_this_case...` for
-   the exact scenario. Fixed with exact backtracking search per connected
-   component of the candidate graph — tractable because real clusters
-   (vehicles passing within a few seconds of each other) are tiny, even
-   though the full candidate graph across a whole clip isn't.
+   the exact scenario.
+
+   First fix used exact backtracking search per connected component of the
+   candidate graph, correct but exponential in the worst case — it fell
+   back to the old non-optimal greedy heuristic above 8 ground-truth rows
+   in one cluster, meaning a large enough multi-vehicle scene would
+   silently lose the guarantee this was built for. Fixed again: now solved
+   as a minimum-cost bipartite assignment via
+   `scipy.optimize.linear_sum_assignment` (genuinely polynomial, O(n^3),
+   for any input size — no fallback needed at all). Maximize-cardinality-
+   then-minimize-distance is achieved with a single min-cost run by padding
+   the cost matrix to square with zero-cost dummy rows/columns
+   ("leave unmatched") and giving out-of-window pairs a cost large enough
+   that using more real, in-window edges always wins. `scipy` is added as
+   an explicit dependency for this — a deliberate, declared use of a
+   well-tested library for a genuinely nontrivial algorithm, not the same
+   mistake as the undeclared transitive `pandas` dependency fixed in #1
+   (that one was doing a job pure Python did just as well).
+
+9. **Ambiguity detection was one-sided.** Only flagged a ground-truth row
+   when 2+ *events* competed for it — missed the mirror case, one event
+   that's a candidate for 2+ *ground-truth rows*. From that GT row's own
+   perspective it only ever saw one candidate event, so the one-sided check
+   never flagged it, even though the match was still a guess (some other
+   GT row wanted that same event too). Fixed: ambiguity is now checked in
+   both directions.
 
 8. **Duplicate detection could falsely flag a legitimate plate.** The
    original version (15s window, edit-distance <=1 all called "duplicate")
@@ -99,6 +123,8 @@ import logging
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from scipy.optimize import linear_sum_assignment
 
 logging.basicConfig(format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -244,166 +270,104 @@ def load_pipeline_events(output_dir: Path) -> list[PipelineEvent]:
 # ============================================================================
 
 
-def _connected_components(candidates: list[tuple[float, int, int]]) -> list[dict]:
-    """Group (gt_index, ev_index) candidate edges into connected components
-    via union-find over a combined ('gt'|'ev', index) node space. Matching
-    decisions in one component never affect another, so each can be solved
-    independently — this is what keeps exact matching (below) tractable:
-    real clusters are tiny (a handful of vehicles within a few seconds of
-    each other), even though the full candidate graph across a whole clip
-    isn't."""
-    parent: dict[tuple, tuple] = {}
+def _flag_ambiguous_ground_truth(gt_rows: list[GroundTruthRow], candidates: list[tuple[float, int, int]]) -> None:
+    """FIX #9 (external review): ambiguity must be checked in BOTH
+    directions. The previous version only flagged a GT row when 2+ EVENTS
+    competed for it. It missed the mirror case: one event that's a
+    candidate for 2+ GT rows. From that GT row's own perspective it only
+    ever saw a single candidate event, so the one-sided check never fired —
+    even though the match is still a guess, since some other GT row wanted
+    that same event too.
 
-    def find(x: tuple) -> tuple:
-        parent.setdefault(x, x)
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: tuple, b: tuple) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
-
-    for _, gt_index, ev_index in candidates:
-        union(("gt", gt_index), ("ev", ev_index))
-
-    components: dict[tuple, dict] = {}
-    for dist, gt_index, ev_index in candidates:
-        root = find(("gt", gt_index))
-        comp = components.setdefault(root, {"gt": set(), "ev": set(), "edges": []})
-        comp["gt"].add(gt_index)
-        comp["ev"].add(ev_index)
-        comp["edges"].append((dist, gt_index, ev_index))
-    return list(components.values())
-
-
-def _greedy_assignment(edges: list[tuple[float, int, int]]) -> dict[int, int]:
-    """The original (FIX #1: no longer used as the primary algorithm — see
-    _best_assignment_for_component) closest-distance-first heuristic. Kept
-    only as a fallback for a pathologically large candidate cluster that
-    exceeds the brute-force limit, which real gate-camera data with a
-    normal time window shouldn't produce."""
-    edges = sorted(edges, key=lambda e: e[0])
-    assigned_gt: set[int] = set()
-    assigned_ev: set[int] = set()
-    assignment: dict[int, int] = {}
-    for _, g, e in edges:
-        if g in assigned_gt or e in assigned_ev:
-            continue
-        assignment[g] = e
-        assigned_gt.add(g)
-        assigned_ev.add(e)
-    return assignment
-
-
-def _best_assignment_for_component(comp: dict, max_brute_force_gt: int = 8) -> dict[int, int]:
-    """Exact minimum-total-distance MAXIMUM matching for one small
-    connected component, via backtracking.
-
-    FIX #1 (external review): global closest-distance-first greedy is not
-    guaranteed optimal, and can be strictly worse in a way that inflates
-    the "Missed" count specifically — not just a different but
-    equally-valid pairing. Concrete counterexample (see
-    tests/test_score_accuracy.py): if GT_A's *only* candidate event is also
-    GT_B's *closest* candidate (GT_B has a second, farther option), greedy
-    grabs the globally-closest pair (B, that event) first, leaving A with
-    nothing to match — a "Missed" that a correct assignment would have
-    avoided by giving A its only option and B its second-best.
-
-    Solved exactly via backtracking rather than approximated, because it's
-    tractable at the sizes that actually occur: this runs per connected
-    component (see _connected_components), and a real cluster of vehicles
-    passing within a few seconds of each other is a handful of rows, not
-    hundreds. Maximizing match COUNT is prioritized over minimizing total
-    distance (an extra correct match is worth more than a slightly closer
-    pairing) — ties in count are broken by total distance.
+    Earlier still (now removed), ambiguity was based on raw GT-to-GT
+    timestamp gaps (2x the window), which fired on almost all normal
+    traffic — caught by testing against synthetic fixtures before trusting
+    it. Candidate-contention (in either direction) is precise: it doesn't
+    fire on routinely-spaced traffic, only where the matcher had a real
+    choice to make.
     """
-    gt_list = sorted(comp["gt"])
-    if len(gt_list) > max_brute_force_gt:
-        logger.warning(
-            "Candidate cluster of %d ground-truth rows exceeds the exact-matching limit (%d) — "
-            "falling back to greedy for this cluster only, which is NOT guaranteed optimal. "
-            "This shouldn't happen for normal gate-camera footage with a sane --time-window; "
-            "if it does, the window is probably set too wide.",
-            len(gt_list), max_brute_force_gt,
-        )
-        return _greedy_assignment(comp["edges"])
+    candidate_count_by_gt: dict[int, int] = {}
+    candidate_count_by_event: dict[int, int] = {}
+    for _, gt_index, ev_index in candidates:
+        candidate_count_by_gt[gt_index] = candidate_count_by_gt.get(gt_index, 0) + 1
+        candidate_count_by_event[ev_index] = candidate_count_by_event.get(ev_index, 0) + 1
 
-    dist_lookup: dict[tuple[int, int], float] = {(g, e): d for d, g, e in comp["edges"]}
-    candidates_for: dict[int, list[int]] = {}
-    for g, e in dist_lookup:
-        candidates_for.setdefault(g, []).append(e)
-
-    best = {"count": -1, "distance": float("inf"), "assignment": {}}
-
-    def backtrack(i: int, used_events: set[int], current: dict[int, int], count: int, total_distance: float) -> None:
-        if i == len(gt_list):
-            if count > best["count"] or (count == best["count"] and total_distance < best["distance"]):
-                best["count"] = count
-                best["distance"] = total_distance
-                best["assignment"] = dict(current)
-            return
-        g = gt_list[i]
-        # Try assigning g to each valid, not-yet-used event...
-        for e in candidates_for.get(g, []):
-            if e in used_events:
-                continue
-            current[g] = e
-            used_events.add(e)
-            backtrack(i + 1, used_events, current, count + 1, total_distance + dist_lookup[(g, e)])
-            used_events.remove(e)
-            del current[g]
-        # ...or leave g unmatched this branch (needed so a later GT row can
-        # claim an event that would otherwise have gone to an earlier one).
-        backtrack(i + 1, used_events, current, count, total_distance)
-
-    backtrack(0, set(), {}, 0, 0.0)
-    return best["assignment"]
+    gt_by_index = {gt.index: gt for gt in gt_rows}
+    for _, gt_index, ev_index in candidates:
+        if candidate_count_by_gt.get(gt_index, 0) > 1 or candidate_count_by_event.get(ev_index, 0) > 1:
+            gt_by_index[gt_index].ambiguous = True
 
 
 def match_events_to_ground_truth(
     gt_rows: list[GroundTruthRow], events: list[PipelineEvent], time_window: float
 ) -> dict[int, int]:
-    """Exact per-component matching (FIX #1) — one event per GT row, one GT
-    row per event, maximizing match count first, then minimizing total
-    distance. See _best_assignment_for_component for why this replaced a
-    global greedy closest-distance-first heuristic.
+    """Exact minimum-cost maximum-cardinality bipartite matching (FIX #7,
+    revised) via `scipy.optimize.linear_sum_assignment` — one event per GT
+    row, one GT row per event, maximizing match count first, then
+    minimizing total distance among assignments tied on count.
 
-    Also sets `.ambiguous` on any GT row that had more than one candidate
-    event within the time window (FIX #3). Earlier draft of this flag
-    compared raw GT-to-GT timestamp gaps against 2x the window, which fires
-    on any two same-type vehicles passing within ~10s of each other — i.e.
-    almost all normal traffic, not a real signal (caught by testing this
-    script against synthetic fixtures before trusting it on real data).
-    Flagging actual candidate contention instead — a GT row where 2+ events
-    were genuinely competing to match it — is precise: it doesn't fire on
-    routinely-spaced traffic, only where the matcher had a real choice to
-    make (including, usefully, when that contention comes from a duplicate
-    event rather than a second real vehicle).
+    Solved per (filename, vehicle_type) group (a GT row and event in
+    different files/types are never candidates for each other regardless
+    of timestamp, same as before). Within a group, maximize-cardinality-
+    then-minimize-distance is achieved with a SINGLE min-cost run: the cost
+    matrix is padded to square with zero-cost dummy rows/columns
+    (representing "leave this one unmatched"), and any out-of-window real
+    pair gets a cost large enough that the solver always prefers using more
+    real, in-window edges over fewer — so it can never be cheaper to leave
+    a matchable row unmatched just to give another row a slightly shorter
+    distance.
+
+    This replaced an earlier version using exact backtracking per connected
+    component: correct but exponential in the worst case, so it fell back
+    to a non-optimal greedy heuristic above 8 GT rows in one cluster — a
+    large enough multi-vehicle scene would silently lose the very guarantee
+    it was built for. linear_sum_assignment is O(n^3) for any input size;
+    no fallback is needed at all.
     """
-    candidates: list[tuple[float, int, int]] = []
+    if not gt_rows or not events:
+        return {}
+
+    groups_gt: dict[tuple[str, str], list[GroundTruthRow]] = {}
     for gt in gt_rows:
-        for ev in events:
-            if ev.filename != gt.filename or ev.vehicle_type != gt.vehicle_type:
-                continue
-            distance = abs(ev.timestamp_sec - gt.timestamp_sec)
-            if distance <= time_window:
-                candidates.append((distance, gt.index, ev.index))
+        groups_gt.setdefault((gt.filename, gt.vehicle_type), []).append(gt)
+    groups_ev: dict[tuple[str, str], list[PipelineEvent]] = {}
+    for ev in events:
+        groups_ev.setdefault((ev.filename, ev.vehicle_type), []).append(ev)
 
-    candidate_count_by_gt: dict[int, int] = {}
-    for _, gt_index, _ in candidates:
-        candidate_count_by_gt[gt_index] = candidate_count_by_gt.get(gt_index, 0) + 1
-
-    gt_by_index = {gt.index: gt for gt in gt_rows}
-    for gt_index, count in candidate_count_by_gt.items():
-        if count > 1:
-            gt_by_index[gt_index].ambiguous = True
-
+    candidates: list[tuple[float, int, int]] = []  # for ambiguity flagging, across all groups
     assignments: dict[int, int] = {}
-    for comp in _connected_components(candidates):
-        assignments.update(_best_assignment_for_component(comp))
+
+    for key, gts in groups_gt.items():
+        evs = groups_ev.get(key, [])
+        if not evs:
+            continue
+
+        n, m = len(gts), len(evs)
+        size = max(n, m)
+        # Any real edge costs at most time_window, and a matching uses at
+        # most `size` edges — this comfortably dominates any achievable
+        # real-edge total, so the solver never prefers an out-of-window
+        # pair over a zero-cost dummy (i.e. leaving something unmatched).
+        large_penalty = (time_window + 1.0) * (size + 1) * 10.0
+
+        cost = [[large_penalty] * size for _ in range(size)]
+        for i, gt in enumerate(gts):
+            for j, ev in enumerate(evs):
+                distance = abs(ev.timestamp_sec - gt.timestamp_sec)
+                if distance <= time_window:
+                    cost[i][j] = distance
+                    candidates.append((distance, gt.index, ev.index))
+        for i in range(size):
+            for j in range(size):
+                if i >= n or j >= m:
+                    cost[i][j] = 0.0  # dummy row/column — costs nothing to "match"
+
+        row_idx, col_idx = linear_sum_assignment(cost)
+        for i, j in zip(row_idx, col_idx):
+            if i < n and j < m and cost[i][j] <= time_window:
+                assignments[gts[i].index] = evs[j].index
+
+    _flag_ambiguous_ground_truth(gt_rows, candidates)
     return assignments
 
 
@@ -542,7 +506,7 @@ def print_console_report(
     print(f"  Incorrect: {incorrect} ({_pct(incorrect, total):.2f}%)")
     print(f"  Missed:    {missed} ({_pct(missed, total):.2f}%)")
     print(f"Ground-truth rows with illegible plate (scored for detection only): {unreadable}")
-    print(f"Ground-truth rows flagged ambiguous (2+ candidate events competed for it): {ambiguous}")
+    print(f"Ground-truth rows flagged ambiguous (contested match, either direction): {ambiguous}")
     print(f"Pipeline false-positive events (matched no ground truth): {len(false_positives)}")
     print(
         f"Candidate duplicate event pairs within {duplicate_window}s: {len(exact_dupes)} exact-plate, "
@@ -659,8 +623,9 @@ def write_markdown_report(
         "",
         f"- Ground-truth rows with an illegible plate (excluded from accuracy %, scored for detection only): "
         f"{sum(1 for r in rows if not r.scorable)}",
-        f"- Ground-truth rows flagged **ambiguous** (2+ pipeline events within {time_window}s competed "
-        f"for this one vehicle — matching can't be fully trusted): {sum(1 for r in rows if r.gt.ambiguous)}",
+        f"- Ground-truth rows flagged **ambiguous** (a contested match within {time_window}s — either "
+        f"2+ events competed for this row, or its matched event was also wanted by another row): "
+        f"{sum(1 for r in rows if r.gt.ambiguous)}",
         f"- False-positive pipeline events (matched no ground truth): {len(false_positives)}",
         f"- Candidate duplicate event pairs within {duplicate_window}s: {len(exact_dupes)} exact-plate, "
         f"{len(near_dupes)} near-plate — a signal, not proof of a bug; see below",
