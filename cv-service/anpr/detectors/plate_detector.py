@@ -133,8 +133,28 @@ class YoloPlateDetector(PlateDetector):
                 )
             )
 
-        # Highest confidence first — callers that just want "the" plate can take detections[0].
-        detections.sort(key=lambda d: d.confidence, reverse=True)
+        # Sort so callers taking detections[0] get the right vehicle's own
+        # plate, not just the highest-confidence plate anywhere in the
+        # margin-expanded crop. FIX (per PR #10 external review): in a
+        # crowded scene, the margin region around vehicle A's box can
+        # contain vehicle B's plate — if B's plate happens to score higher
+        # confidence than A's own (partially occluded/angled) plate, the old
+        # "highest confidence wins" sort would hand A's track vehicle B's
+        # plate text. A plate whose center actually falls inside the
+        # vehicle's own (unexpanded) box is preferred regardless of
+        # confidence; only if none do do we fall back to the margin region,
+        # highest-confidence first.
+        def _sort_key(d: Detection) -> tuple[bool, float]:
+            cx, cy = (d.bbox.x1 + d.bbox.x2) / 2, (d.bbox.y1 + d.bbox.y2) / 2
+            inside_vehicle_box = vehicle_box.x1 <= cx <= vehicle_box.x2 and vehicle_box.y1 <= cy <= vehicle_box.y2
+            return (not inside_vehicle_box, -d.confidence)  # False (inside) sorts before True; then by confidence desc
+
+        detections.sort(key=_sort_key)
+        if detections:
+            logger.debug(
+                "Plate stage: %d candidate(s) for vehicle_box=%s, picked %s (conf=%.2f)",
+                len(detections), vehicle_box.to_int_tuple(), detections[0].bbox.to_int_tuple(), detections[0].confidence,
+            )
         return detections
 
     def _crop_with_margin(self, frame: np.ndarray, vehicle_box: BBox):

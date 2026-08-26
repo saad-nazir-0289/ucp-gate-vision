@@ -43,6 +43,7 @@ class PipelineRunner:
         evidence_dir: str = "output/evidence",
         frame_skip: int = 1,
         min_plate_conf_to_ocr: float = 0.25,
+        ocr_min_confidence_by_class: dict[str, float] | None = None,
     ):
         self.vehicle_detector = vehicle_detector
         self.plate_detector = plate_detector
@@ -51,6 +52,14 @@ class PipelineRunner:
         self.aggregator = BestReadingAggregator(evidence_dir)
         self.frame_skip = max(1, frame_skip)
         self.min_plate_conf_to_ocr = min_plate_conf_to_ocr
+        # Diagnostic for the motorcycle-accuracy gap found in PR #10's
+        # evaluation (28.57% vs 68.42% for cars): the global 0.95 OCR
+        # confidence floor was tuned against car plates and may be silently
+        # dropping genuine-but-lower-confidence motorcycle reads as "missed"
+        # rather than logging them as low-confidence. e.g.
+        # {"motorcycle": 0.75} tests that hypothesis without touching the
+        # car-tuned default. See cv-service/README.md "Known risks".
+        self.ocr_min_confidence_by_class = ocr_min_confidence_by_class or {}
 
         self._events: list[DetectionEvent] = []
         self._seen_track_ids: set[int] = set()
@@ -151,14 +160,33 @@ class PipelineRunner:
             plate_detections = self.plate_detector.detect(clean_frame, latest.bbox)
             if not plate_detections:
                 continue
-            best_plate = plate_detections[0]  # PlateDetector returns confidence-sorted
+            # Sorted "own vehicle's plate first, then by confidence" — see
+            # the sort key in YoloPlateDetector.detect(), not pure confidence.
+            best_plate = plate_detections[0]
             if best_plate.confidence < self.min_plate_conf_to_ocr:
                 continue
 
             x1, y1, x2, y2 = best_plate.bbox.to_int_tuple()
             plate_crop = clean_frame[max(0, y1) : max(0, y2), max(0, x1) : max(0, x2)]
-            text, ocr_conf = self.plate_ocr.read(plate_crop)
+            class_override = self.ocr_min_confidence_by_class.get(track.class_name)
+            try:
+                text, ocr_conf = self.plate_ocr.read(plate_crop, min_confidence_override=class_override)
+            except TypeError:
+                # Not every PlateOCR implementation supports the optional
+                # per-class override (it's not part of the ABC) — fall back.
+                text, ocr_conf = self.plate_ocr.read(plate_crop)
             draw_plate(frame, best_plate.bbox, text, ocr_conf)
+
+            # Stage-level trace (per PR #10 external review's suggestion):
+            # completes the "vehicle found -> plate found -> OCR attempted ->
+            # rejected/emitted" chain alongside the detector-level logs, so a
+            # missed ground-truth vehicle's failure point can be found from
+            # logs alone instead of guessed at.
+            logger.debug(
+                "OCR stage: track=%d class=%s -> %r (conf=%.2f, threshold=%s)",
+                track.track_id, track.class_name, text or None, ocr_conf,
+                class_override if class_override is not None else getattr(self.plate_ocr, "min_confidence", "?"),
+            )
 
             if not text:
                 continue

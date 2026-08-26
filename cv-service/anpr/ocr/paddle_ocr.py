@@ -80,7 +80,17 @@ class PaddleOCRPlateReader(PlateOCR):
             )
             self._ocr = PaddleOCR(lang=lang)
 
-    def read(self, plate_crop: np.ndarray) -> tuple[str, float]:
+    def read(self, plate_crop: np.ndarray, min_confidence_override: float | None = None) -> tuple[str, float]:
+        # `min_confidence_override` is not part of the PlateOCR ABC — it's an
+        # optional extra so PipelineRunner can apply a per-vehicle-class
+        # threshold (see its `ocr_min_confidence_by_class`) without changing
+        # the interface every PlateOCR implementation must satisfy. Added to
+        # test the hypothesis that a global 0.95 floor (tuned against car
+        # plates) silently drops genuine-but-lower-confidence motorcycle
+        # reads as "missed" rather than logging them at all — see
+        # cv-service/README.md "Known risks".
+        threshold = min_confidence_override if min_confidence_override is not None else self.min_confidence
+
         if plate_crop is None or plate_crop.size == 0:
             return "", 0.0
 
@@ -100,7 +110,12 @@ class PaddleOCRPlateReader(PlateOCR):
         confidence = float(min(scores)) if scores else 0.0  # weakest line caps overall confidence
         cleaned = _NON_ALNUM_RE.sub("", raw_text.upper())
 
-        if not cleaned or confidence < self.min_confidence:
+        if not cleaned:
+            return "", confidence
+        if confidence < threshold:
+            logger.debug(
+                "Rejecting OCR read %r (conf=%.2f) — below confidence floor %.2f", cleaned, confidence, threshold
+            )
             return "", confidence
 
         if self.plate_pattern is not None and not self.plate_pattern.match(cleaned):

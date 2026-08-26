@@ -58,7 +58,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "'botsort.yaml' (adds appearance-based ReID — more robust across occlusion/gaps, more compute)",
     )
     p.add_argument("--frame-skip", type=int, default=1, help="Process every Nth frame (1 = every frame)")
-    p.add_argument("--vehicle-conf", type=float, default=0.35)
+    p.add_argument(
+        "--imgsz",
+        type=int,
+        default=1280,
+        help="Ultralytics inference resolution for the vehicle detector. Was implicitly 640 (the "
+        "library default) — verified via the external PR #10 review that at 2560x1440 source "
+        "frames, 640 shrinks a motorcycle to ~37px before the model sees it. Sweep 640/960/1280.",
+    )
+    p.add_argument(
+        "--vehicle-conf",
+        type=float,
+        default=0.10,
+        help="Was 0.35. VERIFIED against ultralytics' bytetrack.yaml: ByteTrack's low-confidence "
+        "recovery matches down to track_low_thresh=0.1, but conf=0.35 discarded everything below "
+        "that before ByteTrack ever saw it, defeating its signature recovery feature. 0.10 lets "
+        "the tracker's own thresholds govern association instead of a blunt upstream filter.",
+    )
     p.add_argument("--plate-conf", type=float, default=0.25)
     p.add_argument(
         "--ocr-min-conf",
@@ -68,6 +84,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "track fragments while every genuine plate read still clears it (0.96-0.9997 on the "
         "winning frame). Trade-off: a genuine plate that never gets a clear enough frame is "
         "silently dropped instead of flagged low-confidence — watch for this on harder footage.",
+    )
+    p.add_argument(
+        "--ocr-min-conf-motorcycle",
+        type=float,
+        default=None,
+        help="Diagnostic for PR #10's finding (motorcycle accuracy 28.57%% vs car 68.42%%): overrides "
+        "--ocr-min-conf for motorcycle tracks only, since the 0.95 default was tuned against car "
+        "plates and may be silently dropping genuine-but-lower-confidence motorcycle reads as "
+        "'missed'. Try e.g. 0.75 and compare motorcycle miss counts against a run without this flag.",
     )
     p.add_argument("--log-level", default="INFO")
     return p
@@ -90,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         weights=args.vehicle_weights,
         device=args.device,
         conf_threshold=args.vehicle_conf,
+        imgsz=args.imgsz,
         tracker_cfg=args.tracker,
     )
 
@@ -105,6 +131,10 @@ def main(argv: list[str] | None = None) -> int:
 
     tracker = ByteTrackTracker(fps=fps / max(1, args.frame_skip))
 
+    ocr_min_confidence_by_class = {}
+    if args.ocr_min_conf_motorcycle is not None:
+        ocr_min_confidence_by_class["motorcycle"] = args.ocr_min_conf_motorcycle
+
     runner = PipelineRunner(
         vehicle_detector=vehicle_detector,
         plate_detector=plate_detector,
@@ -113,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         evidence_dir=args.evidence_dir,
         frame_skip=args.frame_skip,
         min_plate_conf_to_ocr=args.plate_conf,
+        ocr_min_confidence_by_class=ocr_min_confidence_by_class,
     )
 
     log.info("Running pipeline on %s ...", args.video)
