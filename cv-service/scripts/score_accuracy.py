@@ -45,6 +45,37 @@ are fixed:
    detections of one physical pass (a tracking/dedup issue, scored
    separately from OCR accuracy so it doesn't get conflated with it).
 
+Two more issues found in a follow-up review of this file specifically
+(not PR #10's version — these are ones this rewrite introduced):
+
+7. **Greedy timestamp matching could produce a worse result than
+   necessary.** `match_events_to_ground_truth` used to sort all
+   (ground-truth, event) candidate pairs by distance and greedily assign
+   the globally-closest pair first. This isn't guaranteed optimal — a
+   concrete failure mode: if ground-truth row A's *only* candidate event is
+   also row B's *closest* (but not only) candidate, greedy grabs that event
+   for B first, leaving A unmatched ("Missed") even though assigning A its
+   sole option and B its second-best would have matched both. See
+   `_best_assignment_for_component` and
+   `tests/test_score_accuracy.py::test_greedy_would_fail_this_case...` for
+   the exact scenario. Fixed with exact backtracking search per connected
+   component of the candidate graph — tractable because real clusters
+   (vehicles passing within a few seconds of each other) are tiny, even
+   though the full candidate graph across a whole clip isn't.
+
+8. **Duplicate detection could falsely flag a legitimate plate.** The
+   original version (15s window, edit-distance <=1 all called "duplicate")
+   would flag a vehicle that genuinely reappears within 15 seconds — e.g.
+   entering, realizing it's the wrong gate, and immediately driving back
+   out — as a tracking bug, when it's actually two correct, separate
+   events. Fixed by: shrinking the default window to 5s (closer to the
+   tracker's own reconciliation window, so a duplicate surviving past that
+   is more informative either way); splitting exact-plate matches from
+   near-plate (edit-distance 1) matches, since the latter could just as
+   easily be two different, coincidentally similar plates; and rewording
+   every report to "candidate duplicate" with the legitimate-reappearance
+   explanation stated explicitly, instead of asserting it's a bug.
+
 Also handles a real data quirk explicitly: sample_data/README.md notes that
 a blank `plate` value in ground_truth.csv means the plate "wasn't readable
 from human eye." Those rows can't fairly judge OCR *correctness* (there's
@@ -64,14 +95,19 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logging.basicConfig(format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_GROUND_TRUTH = BASE_DIR / "sample_data" / "ground_truth.csv"
 DEFAULT_OUTPUT_DIR = BASE_DIR / "output"
 DEFAULT_TIME_WINDOW = 5.0  # seconds — same as PR #10's version, kept for comparability
+DEFAULT_DUPLICATE_WINDOW = 5.0  # seconds — see find_duplicate_events docstring for why this shrunk from 15s
 
 
 # ============================================================================
@@ -208,11 +244,132 @@ def load_pipeline_events(output_dir: Path) -> list[PipelineEvent]:
 # ============================================================================
 
 
+def _connected_components(candidates: list[tuple[float, int, int]]) -> list[dict]:
+    """Group (gt_index, ev_index) candidate edges into connected components
+    via union-find over a combined ('gt'|'ev', index) node space. Matching
+    decisions in one component never affect another, so each can be solved
+    independently — this is what keeps exact matching (below) tractable:
+    real clusters are tiny (a handful of vehicles within a few seconds of
+    each other), even though the full candidate graph across a whole clip
+    isn't."""
+    parent: dict[tuple, tuple] = {}
+
+    def find(x: tuple) -> tuple:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: tuple, b: tuple) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for _, gt_index, ev_index in candidates:
+        union(("gt", gt_index), ("ev", ev_index))
+
+    components: dict[tuple, dict] = {}
+    for dist, gt_index, ev_index in candidates:
+        root = find(("gt", gt_index))
+        comp = components.setdefault(root, {"gt": set(), "ev": set(), "edges": []})
+        comp["gt"].add(gt_index)
+        comp["ev"].add(ev_index)
+        comp["edges"].append((dist, gt_index, ev_index))
+    return list(components.values())
+
+
+def _greedy_assignment(edges: list[tuple[float, int, int]]) -> dict[int, int]:
+    """The original (FIX #1: no longer used as the primary algorithm — see
+    _best_assignment_for_component) closest-distance-first heuristic. Kept
+    only as a fallback for a pathologically large candidate cluster that
+    exceeds the brute-force limit, which real gate-camera data with a
+    normal time window shouldn't produce."""
+    edges = sorted(edges, key=lambda e: e[0])
+    assigned_gt: set[int] = set()
+    assigned_ev: set[int] = set()
+    assignment: dict[int, int] = {}
+    for _, g, e in edges:
+        if g in assigned_gt or e in assigned_ev:
+            continue
+        assignment[g] = e
+        assigned_gt.add(g)
+        assigned_ev.add(e)
+    return assignment
+
+
+def _best_assignment_for_component(comp: dict, max_brute_force_gt: int = 8) -> dict[int, int]:
+    """Exact minimum-total-distance MAXIMUM matching for one small
+    connected component, via backtracking.
+
+    FIX #1 (external review): global closest-distance-first greedy is not
+    guaranteed optimal, and can be strictly worse in a way that inflates
+    the "Missed" count specifically — not just a different but
+    equally-valid pairing. Concrete counterexample (see
+    tests/test_score_accuracy.py): if GT_A's *only* candidate event is also
+    GT_B's *closest* candidate (GT_B has a second, farther option), greedy
+    grabs the globally-closest pair (B, that event) first, leaving A with
+    nothing to match — a "Missed" that a correct assignment would have
+    avoided by giving A its only option and B its second-best.
+
+    Solved exactly via backtracking rather than approximated, because it's
+    tractable at the sizes that actually occur: this runs per connected
+    component (see _connected_components), and a real cluster of vehicles
+    passing within a few seconds of each other is a handful of rows, not
+    hundreds. Maximizing match COUNT is prioritized over minimizing total
+    distance (an extra correct match is worth more than a slightly closer
+    pairing) — ties in count are broken by total distance.
+    """
+    gt_list = sorted(comp["gt"])
+    if len(gt_list) > max_brute_force_gt:
+        logger.warning(
+            "Candidate cluster of %d ground-truth rows exceeds the exact-matching limit (%d) — "
+            "falling back to greedy for this cluster only, which is NOT guaranteed optimal. "
+            "This shouldn't happen for normal gate-camera footage with a sane --time-window; "
+            "if it does, the window is probably set too wide.",
+            len(gt_list), max_brute_force_gt,
+        )
+        return _greedy_assignment(comp["edges"])
+
+    dist_lookup: dict[tuple[int, int], float] = {(g, e): d for d, g, e in comp["edges"]}
+    candidates_for: dict[int, list[int]] = {}
+    for g, e in dist_lookup:
+        candidates_for.setdefault(g, []).append(e)
+
+    best = {"count": -1, "distance": float("inf"), "assignment": {}}
+
+    def backtrack(i: int, used_events: set[int], current: dict[int, int], count: int, total_distance: float) -> None:
+        if i == len(gt_list):
+            if count > best["count"] or (count == best["count"] and total_distance < best["distance"]):
+                best["count"] = count
+                best["distance"] = total_distance
+                best["assignment"] = dict(current)
+            return
+        g = gt_list[i]
+        # Try assigning g to each valid, not-yet-used event...
+        for e in candidates_for.get(g, []):
+            if e in used_events:
+                continue
+            current[g] = e
+            used_events.add(e)
+            backtrack(i + 1, used_events, current, count + 1, total_distance + dist_lookup[(g, e)])
+            used_events.remove(e)
+            del current[g]
+        # ...or leave g unmatched this branch (needed so a later GT row can
+        # claim an event that would otherwise have gone to an earlier one).
+        backtrack(i + 1, used_events, current, count, total_distance)
+
+    backtrack(0, set(), {}, 0, 0.0)
+    return best["assignment"]
+
+
 def match_events_to_ground_truth(
     gt_rows: list[GroundTruthRow], events: list[PipelineEvent], time_window: float
 ) -> dict[int, int]:
-    """Global closest-timestamp-first assignment — one event per GT row, one
-    GT row per event. This part of PR #10's approach was sound; kept as-is.
+    """Exact per-component matching (FIX #1) — one event per GT row, one GT
+    row per event, maximizing match count first, then minimizing total
+    distance. See _best_assignment_for_component for why this replaced a
+    global greedy closest-distance-first heuristic.
 
     Also sets `.ambiguous` on any GT row that had more than one candidate
     event within the time window (FIX #3). Earlier draft of this flag
@@ -234,7 +391,6 @@ def match_events_to_ground_truth(
             distance = abs(ev.timestamp_sec - gt.timestamp_sec)
             if distance <= time_window:
                 candidates.append((distance, gt.index, ev.index))
-    candidates.sort(key=lambda c: c[0])
 
     candidate_count_by_gt: dict[int, int] = {}
     for _, gt_index, _ in candidates:
@@ -245,25 +401,45 @@ def match_events_to_ground_truth(
         if count > 1:
             gt_by_index[gt_index].ambiguous = True
 
-    assigned_gt: set[int] = set()
-    assigned_ev: set[int] = set()
     assignments: dict[int, int] = {}
-    for _, gt_index, ev_index in candidates:
-        if gt_index in assigned_gt or ev_index in assigned_ev:
-            continue
-        assignments[gt_index] = ev_index
-        assigned_gt.add(gt_index)
-        assigned_ev.add(ev_index)
+    for comp in _connected_components(candidates):
+        assignments.update(_best_assignment_for_component(comp))
     return assignments
 
 
 def find_duplicate_events(
-    events: list[PipelineEvent], window_sec: float = 15.0, max_edit_distance: int = 1
-) -> list[tuple[PipelineEvent, PipelineEvent]]:
-    """FIX #6: same-file events reading the same (or near-identical) plate
-    within `window_sec` of each other — almost certainly one physical pass
-    logged twice, a tracking/dedup issue rather than an OCR accuracy one."""
-    duplicates: list[tuple[PipelineEvent, PipelineEvent]] = []
+    events: list[PipelineEvent], window_sec: float = 5.0, max_near_edit_distance: int = 1
+) -> tuple[list[tuple[PipelineEvent, PipelineEvent]], list[tuple[PipelineEvent, PipelineEvent]]]:
+    """FIX #6, revised (external review — the original version could
+    falsely flag a legitimate plate): returns (exact_duplicates,
+    near_duplicates), same-file event pairs within `window_sec` of each
+    other, split by how sure we can actually be:
+
+    - exact_duplicates: identical plate text. Still not *proof* of a
+      tracking bug — a vehicle can legitimately reappear within the window
+      (e.g. entering, immediately realizing it's the wrong gate, and
+      driving straight back out) — but identical text at least means it's
+      the same plate, not a coincidence of two different vehicles.
+    - near_duplicates: plate text differs by up to `max_near_edit_distance`
+      characters. This is weaker evidence twice over: it could be the same
+      pass read slightly differently by OCR on two track fragments (the
+      original intent), OR it could be two genuinely different vehicles
+      with coincidentally similar plates (e.g. "AAA111" vs "AAA112" from
+      the same series) that aren't related at all. Report, don't assert.
+
+    Defaults changed from the original 15s/edit-distance-1-as-one-bucket:
+    the window shrunk to 5s (closer to the tracker's own reconciliation
+    window — anything the tracker's IoU-merge should have already caught
+    resolves well within a couple seconds; a duplicate surviving past that
+    is more likely either a genuine second pass or a merge-logic gap worth
+    knowing about on its own, not something a wide 15s net should paper
+    over by lumping in unrelated re-passes). Both the window and the
+    near-duplicate threshold are CLI-configurable — there's no universally
+    correct value, only a default that errs toward under- rather than
+    over-claiming.
+    """
+    exact: list[tuple[PipelineEvent, PipelineEvent]] = []
+    near: list[tuple[PipelineEvent, PipelineEvent]] = []
     by_file: dict[str, list[PipelineEvent]] = {}
     for ev in events:
         if ev.plate:
@@ -274,9 +450,12 @@ def find_duplicate_events(
             for b in evs[i + 1 :]:
                 if b.timestamp_sec - a.timestamp_sec > window_sec:
                     break
-                if edit_distance(a.plate, b.plate) <= max_edit_distance:
-                    duplicates.append((a, b))
-    return duplicates
+                dist = edit_distance(a.plate, b.plate)
+                if dist == 0:
+                    exact.append((a, b))
+                elif dist <= max_near_edit_distance:
+                    near.append((a, b))
+    return exact, near
 
 
 # ============================================================================
@@ -339,9 +518,11 @@ def print_console_report(
     rows: list[ScoredRow],
     events: list[PipelineEvent],
     assignments: dict[int, int],
-    duplicates: list[tuple[PipelineEvent, PipelineEvent]],
+    duplicates: tuple[list[tuple[PipelineEvent, PipelineEvent]], list[tuple[PipelineEvent, PipelineEvent]]],
     time_window: float,
+    duplicate_window: float,
 ) -> None:
+    exact_dupes, near_dupes = duplicates
     scorable = [r for r in rows if r.scorable]
     correct = sum(1 for r in scorable if r.result == "Correct")
     incorrect = sum(1 for r in scorable if r.result == "Incorrect")
@@ -363,7 +544,10 @@ def print_console_report(
     print(f"Ground-truth rows with illegible plate (scored for detection only): {unreadable}")
     print(f"Ground-truth rows flagged ambiguous (2+ candidate events competed for it): {ambiguous}")
     print(f"Pipeline false-positive events (matched no ground truth): {len(false_positives)}")
-    print(f"Likely duplicate event pairs (same plate, same file, within 15s): {len(duplicates)}")
+    print(
+        f"Candidate duplicate event pairs within {duplicate_window}s: {len(exact_dupes)} exact-plate, "
+        f"{len(near_dupes)} near-plate (NOT proof of a bug either way — see 'CANDIDATE DUPLICATE EVENTS' below)"
+    )
     print(f"Time window used for matching: {time_window}s")
     print()
 
@@ -400,12 +584,25 @@ def print_console_report(
             print(f"  {ev.filename} t={ev.timestamp_sec}s track={ev.track_id} class={ev.vehicle_type} plate={ev.plate!r}")
         print()
 
-    if duplicates:
+    if exact_dupes or near_dupes:
         print("=" * 60)
-        print("LIKELY DUPLICATE EVENTS")
+        print("CANDIDATE DUPLICATE EVENTS")
         print("=" * 60)
-        for a, b in duplicates:
-            print(f"  {a.filename}: track {a.track_id} ({a.plate!r}@{a.timestamp_sec}s) vs track {b.track_id} ({b.plate!r}@{b.timestamp_sec}s)")
+        print(
+            "Same plate (or near-identical text) logged twice, close in time. This is a SIGNAL, "
+            "not proof: it could be a tracking/dedup bug (same physical pass logged twice), or a "
+            "vehicle legitimately reappearing quickly (e.g. entering, realizing it's the wrong "
+            "gate, and immediately leaving). Check evidence images/track history before treating "
+            "any of these as confirmed bugs."
+        )
+        if exact_dupes:
+            print(f"\nExact-plate matches ({len(exact_dupes)}):")
+            for a, b in exact_dupes:
+                print(f"  {a.filename}: track {a.track_id} ({a.plate!r}@{a.timestamp_sec}s) vs track {b.track_id} ({b.plate!r}@{b.timestamp_sec}s)")
+        if near_dupes:
+            print(f"\nNear-plate matches ({len(near_dupes)}) — could also be two different, coincidentally similar plates:")
+            for a, b in near_dupes:
+                print(f"  {a.filename}: track {a.track_id} ({a.plate!r}@{a.timestamp_sec}s) vs track {b.track_id} ({b.plate!r}@{b.timestamp_sec}s)")
         print()
 
 
@@ -431,10 +628,12 @@ def write_markdown_report(
     rows: list[ScoredRow],
     events: list[PipelineEvent],
     assignments: dict[int, int],
-    duplicates: list[tuple[PipelineEvent, PipelineEvent]],
+    duplicates: tuple[list[tuple[PipelineEvent, PipelineEvent]], list[tuple[PipelineEvent, PipelineEvent]]],
     time_window: float,
+    duplicate_window: float,
     path: Path,
 ) -> None:
+    exact_dupes, near_dupes = duplicates
     scorable = [r for r in rows if r.scorable]
     correct = sum(1 for r in scorable if r.result == "Correct")
     incorrect = sum(1 for r in scorable if r.result == "Incorrect")
@@ -463,7 +662,8 @@ def write_markdown_report(
         f"- Ground-truth rows flagged **ambiguous** (2+ pipeline events within {time_window}s competed "
         f"for this one vehicle — matching can't be fully trusted): {sum(1 for r in rows if r.gt.ambiguous)}",
         f"- False-positive pipeline events (matched no ground truth): {len(false_positives)}",
-        f"- Likely duplicate event pairs: {len(duplicates)}",
+        f"- Candidate duplicate event pairs within {duplicate_window}s: {len(exact_dupes)} exact-plate, "
+        f"{len(near_dupes)} near-plate — a signal, not proof of a bug; see below",
         f"- Matching time window: {time_window}s",
         "",
         "## By Vehicle Type",
@@ -497,10 +697,30 @@ def write_markdown_report(
         for ev in false_positives:
             lines.append(f"| {ev.filename} | {ev.timestamp_sec}s | {ev.track_id} | {ev.vehicle_type} | `{ev.plate}` |")
 
-    if duplicates:
-        lines += ["", "## Likely Duplicate Events", "", "| File | Track A | Plate A | t A | Track B | Plate B | t B |", "|---|---:|---|---:|---:|---|---:|"]
-        for a, b in duplicates:
-            lines.append(f"| {a.filename} | {a.track_id} | `{a.plate}` | {a.timestamp_sec}s | {b.track_id} | `{b.plate}` | {b.timestamp_sec}s |")
+    if exact_dupes or near_dupes:
+        lines += [
+            "",
+            "## Candidate Duplicate Events",
+            "",
+            "A signal, not proof of a bug: could be one physical pass logged twice (tracking/dedup "
+            "issue), or a vehicle legitimately reappearing quickly (e.g. entering, realizing it's "
+            "the wrong gate, and immediately leaving). Check evidence images/track history before "
+            "treating any of these as confirmed bugs.",
+        ]
+        if exact_dupes:
+            lines += ["", "### Exact plate match", "", "| File | Track A | Plate A | t A | Track B | Plate B | t B |", "|---|---:|---|---:|---:|---|---:|"]
+            for a, b in exact_dupes:
+                lines.append(f"| {a.filename} | {a.track_id} | `{a.plate}` | {a.timestamp_sec}s | {b.track_id} | `{b.plate}` | {b.timestamp_sec}s |")
+        if near_dupes:
+            lines += [
+                "",
+                "### Near plate match (could be two different, coincidentally similar plates)",
+                "",
+                "| File | Track A | Plate A | t A | Track B | Plate B | t B |",
+                "|---|---:|---|---:|---:|---|---:|",
+            ]
+            for a, b in near_dupes:
+                lines.append(f"| {a.filename} | {a.track_id} | `{a.plate}` | {a.timestamp_sec}s | {b.track_id} | `{b.plate}` | {b.timestamp_sec}s |")
 
     ambiguous_rows = [r.gt for r in rows if r.gt.ambiguous]
     if ambiguous_rows:
@@ -533,6 +753,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ground-truth", type=Path, default=DEFAULT_GROUND_TRUTH)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--time-window", type=float, default=DEFAULT_TIME_WINDOW)
+    parser.add_argument(
+        "--duplicate-window", type=float, default=DEFAULT_DUPLICATE_WINDOW,
+        help="Seconds within which two same-plate events in one file are flagged as a candidate "
+        "duplicate. Default is intentionally short (see find_duplicate_events docstring) — widen "
+        "it if you specifically want to catch slower re-passes, at the cost of more false alarms "
+        "on legitimate quick reappearances.",
+    )
+    parser.add_argument(
+        "--duplicate-max-edit-distance", type=int, default=1,
+        help="Max character difference still counted as a 'near' duplicate (0 = exact-plate only).",
+    )
     parser.add_argument("--results-csv", type=Path, default=None, help="Default: <output-dir>/accuracy_results.csv")
     parser.add_argument("--report", type=Path, default=None, help="Optional path to write a markdown report, e.g. docs/ACCURACY_REPORT.md")
     args = parser.parse_args(argv)
@@ -548,20 +779,20 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     assignments = match_events_to_ground_truth(gt_rows, events, args.time_window)
-    duplicates = find_duplicate_events(events)
+    duplicates = find_duplicate_events(events, window_sec=args.duplicate_window, max_near_edit_distance=args.duplicate_max_edit_distance)
     rows = score(gt_rows, events, assignments)
 
     print(f"Ground-truth vehicles: {len(gt_rows)}")
     print(f"Pipeline events:       {len(events)}")
     print()
-    print_console_report(rows, events, assignments, duplicates, args.time_window)
+    print_console_report(rows, events, assignments, duplicates, args.time_window, args.duplicate_window)
 
     results_csv = args.results_csv or (args.output_dir / "accuracy_results.csv")
     write_results_csv(rows, results_csv)
     print(f"Detailed results written to: {results_csv}")
 
     if args.report:
-        write_markdown_report(rows, events, assignments, duplicates, args.time_window, args.report)
+        write_markdown_report(rows, events, assignments, duplicates, args.time_window, args.duplicate_window, args.report)
         print(f"Markdown report written to: {args.report}")
 
     return 0
