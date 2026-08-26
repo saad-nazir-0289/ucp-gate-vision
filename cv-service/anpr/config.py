@@ -1,4 +1,14 @@
-"""Pipeline configuration defaults. Overridden by run_pipeline.py CLI flags.
+"""Pipeline configuration defaults — the single source of truth for them.
+
+run_pipeline.py's CLI flags read their `default=` values from a module-level
+`DEFAULTS = PipelineConfig()` instance instead of hardcoding numbers a
+second time. External review caught this drifting out of sync before: this
+file said vehicle_conf=0.35/car+motorcycle-only/no imgsz while the CLI had
+already moved to 0.10/+bus+truck/imgsz=1280 — anyone importing PipelineConfig
+directly (or using it as a config file base in Phase 2) would silently get
+the stale, disproven defaults. Wiring it up as the actual source removes the
+duplication that let that happen rather than just re-syncing the numbers
+once.
 
 Phase 2 will replace/extend this with the per-gate YAML/JSON config
 (gate_id, camera source URI, inbound_reference_vector, camera_angle_deg)
@@ -12,6 +22,8 @@ from dataclasses import dataclass
 # COCO class ids used by the pretrained Ultralytics COCO weights.
 COCO_CAR = 2
 COCO_MOTORCYCLE = 3
+COCO_BUS = 5
+COCO_TRUCK = 7
 
 
 @dataclass
@@ -20,9 +32,20 @@ class PipelineConfig:
     plate_weights: str = "models/plate_detector.pt"
     device: str = "cpu"
 
-    vehicle_conf: float = 0.35
+    # Was 0.35. VERIFIED against ultralytics' shipped bytetrack.yaml:
+    # ByteTrack's low-confidence recovery matches down to
+    # track_low_thresh=0.1, but conf=0.35 discarded everything below that
+    # before ByteTrack ever saw it, defeating its own recovery feature.
+    vehicle_conf: float = 0.10
     vehicle_iou: float = 0.5
-    vehicle_classes: tuple[int, ...] = (COCO_CAR, COCO_MOTORCYCLE)
+    # Bus/truck included defensively: a car-like vehicle can be
+    # misclassified by the generic COCO-pretrained detector — confirmed by
+    # testing — and without these classes it's silently dropped rather than
+    # logged under the wrong class.
+    vehicle_classes: tuple[int, ...] = (COCO_CAR, COCO_MOTORCYCLE, COCO_BUS, COCO_TRUCK)
+    # Was implicitly 640 (ultralytics' default when unset). Source frames at
+    # 2560x1440 shrink a ~150px motorcycle to ~37px at 640.
+    imgsz: int = 1280
     tracker_cfg: str = "bytetrack.yaml"  # Ultralytics' built-in tracker config, resolved by name
 
     plate_conf: float = 0.25

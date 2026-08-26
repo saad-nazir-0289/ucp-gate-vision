@@ -3,9 +3,21 @@
 See YoloVehicleDetector's docstring for why ID assignment happens inside the
 detector call. This class's job is temporal state: building/maintaining
 per-track history (consumed by Phase 2's direction inference), expiring
-stale tracks, providing a real IoU-based fallback ID assignment for any
-detection that arrives without a pre-assigned track_id, and reconciling a
-track whose ID changed mid-pass (see `_reconcile_id`).
+stale tracks, discarding detections ByteTrack itself declined to track
+(see `discard_untracked_detections`), and reconciling a track whose ID
+changed mid-pass (see `_reconcile_id`).
+
+Known architectural compromise (external review, acknowledged not fixed):
+the "textbook correct" design would have VehicleDetector call `.predict()`
+only and this Tracker own ByteTrack entirely via Ultralytics' lower-level
+`BYTETracker` class, so a `None` track_id unambiguously means "needs
+assignment." The current pairing — VehicleDetector does its own tracking
+via the high-level `.track()` API — means this Tracker has to interpret
+what a missing track_id means, which is fragile (see the fix in
+`discard_untracked_detections`). Not restructured now: `.track()` is the
+stable, documented Ultralytics API; `BYTETracker` is lower-level/semi-
+private and was deliberately avoided earlier for that reason. Worth
+revisiting in Phase 2 if this class of bug recurs.
 """
 from __future__ import annotations
 
@@ -28,12 +40,33 @@ class ByteTrackTracker(Tracker):
         iou_fallback_threshold: float = 0.3,
         merge_iou_threshold: float = 0.5,
         history_maxlen: int = 600,
+        discard_untracked_detections: bool = True,
     ):
         self.fps = fps or 30.0
         self.max_age_frames = max_age_frames
         self.iou_fallback_threshold = iou_fallback_threshold
         self.merge_iou_threshold = merge_iou_threshold
         self.history_maxlen = history_maxlen
+        # CRITICAL FIX (external review, verified against real logs before
+        # merging): when paired with YoloVehicleDetector (which does its own
+        # tracking via .track()), a detection with track_id=None doesn't
+        # mean "this detector never assigns IDs" — it means ByteTrack looked
+        # at this exact detection and refused to start a track for it
+        # (below its own new_track_thresh, default 0.25). The IoU fallback
+        # below was originally meant for a hypothetical future
+        # VehicleDetector that never tracks at all, where None really would
+        # mean "needs ID assignment." Routing ByteTrack's *rejected*
+        # detections through that same fallback silently un-rejects them —
+        # confirmed on real footage: lowering vehicle_conf to 0.10 (to let
+        # ByteTrack's own low-confidence recovery work) let genuine noise
+        # through the detector, ByteTrack correctly refused to track it
+        # (returned track_id=None), and this fallback tracked it anyway,
+        # producing fallback IDs 1000000+ in the logs and 11 tracks for 3
+        # real vehicles in one test run. Default True: discard detections
+        # with no track_id instead of fallback-tracking them. Only set
+        # False if paired with a VehicleDetector that genuinely never
+        # assigns track_ids itself (the fallback's original purpose).
+        self.discard_untracked_detections = discard_untracked_detections
 
         self._tracks: dict[int, Track] = {}
         self._frame_idx = -1
@@ -50,8 +83,9 @@ class ByteTrackTracker(Tracker):
         for det in detections:
             if det.track_id is not None:
                 pre_assigned.append((det, det.track_id))
-            else:
+            elif not self.discard_untracked_detections:
                 unresolved.append(det)
+            # else: dropped — see discard_untracked_detections above.
 
         assigned = pre_assigned + self._fallback_match(unresolved)
 

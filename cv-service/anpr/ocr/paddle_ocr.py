@@ -20,20 +20,30 @@ _NON_ALNUM_RE = re.compile(r"[^A-Z0-9]")
 # detector's geometric filters (edge/size/aspect-ratio in
 # anpr/detectors/plate_detector.py), not a replacement for them — catches
 # false positives whose box geometry looks plate-like but whose text doesn't.
-# Tune/replace for plate formats outside 2-4 letters + 2-4 digits.
+# Tune/replace for plate formats outside 2-4 letters + 2-4 digits. Lives
+# here (not in PlateOCR) since it's a acceptance decision, applied by
+# whoever calls read() — see PipelineRunner.
 DEFAULT_PLATE_PATTERN = re.compile(r"^[A-Z]{2,4}[0-9]{2,4}$")
 
 
 class PaddleOCRPlateReader(PlateOCR):
     """Reads a plate string + confidence from a cropped plate image.
 
-    Only light cleanup is applied (uppercase, strip non-alphanumeric OCR
-    noise) plus a plate-shaped format check (see DEFAULT_PLATE_PATTERN) —
-    this is deliberately NOT full plate normalization/matching. Per
-    docs/DATABASE_SCHEMA.md, fuzzy matching against `plate_number_matched`
-    happens in the backend at write time (Phase 3); this class only emits
-    the "as read" string (FR-3.1's `plate_number_raw`), format-checked just
-    enough to reject obvious non-plate text.
+    Only light, non-judgmental cleanup is applied (uppercase, strip
+    non-alphanumeric OCR noise) — this always returns PaddleOCR's raw
+    recognized text and confidence, never an accept/reject decision.
+
+    Design note (external review — fixed): an earlier version accepted a
+    `min_confidence_override` kwarg not part of the PlateOCR ABC, with
+    callers catching TypeError to detect whether a given implementation
+    supported it. That's backwards: OCR's job is "what text is here, how
+    confident are you," full stop — deciding whether that's good enough is
+    contextual (which vehicle class, which threshold sweep is being tested)
+    and belongs in the caller (PipelineRunner), not baked into this class.
+    Moving it out also makes offline threshold sweeping trivial: change the
+    runner's threshold, no need to reconstruct this class. Confidence
+    filtering and DEFAULT_PLATE_PATTERN format-checking both now happen in
+    PipelineRunner._process_frame.
 
     Known risk: PaddleOCR's Python API changed materially between the 2.x
     line (`PaddleOCR(use_angle_cls=..., use_gpu=...)` + `.ocr(img, cls=True)`)
@@ -49,17 +59,10 @@ class PaddleOCRPlateReader(PlateOCR):
     def __init__(
         self,
         lang: str = "en",
-        min_confidence: float = 0.30,
         use_textline_orientation: bool = True,
         device: str | None = None,
-        plate_pattern: re.Pattern | None = DEFAULT_PLATE_PATTERN,
     ):
         from paddleocr import PaddleOCR
-
-        self.min_confidence = min_confidence
-        # None disables the format check entirely (e.g. for a non-Pakistani
-        # plate format that doesn't fit DEFAULT_PLATE_PATTERN).
-        self.plate_pattern = plate_pattern
 
         kwargs = dict(
             lang=lang,
@@ -80,17 +83,11 @@ class PaddleOCRPlateReader(PlateOCR):
             )
             self._ocr = PaddleOCR(lang=lang)
 
-    def read(self, plate_crop: np.ndarray, min_confidence_override: float | None = None) -> tuple[str, float]:
-        # `min_confidence_override` is not part of the PlateOCR ABC — it's an
-        # optional extra so PipelineRunner can apply a per-vehicle-class
-        # threshold (see its `ocr_min_confidence_by_class`) without changing
-        # the interface every PlateOCR implementation must satisfy. Added to
-        # test the hypothesis that a global 0.95 floor (tuned against car
-        # plates) silently drops genuine-but-lower-confidence motorcycle
-        # reads as "missed" rather than logging them at all — see
-        # cv-service/README.md "Known risks".
-        threshold = min_confidence_override if min_confidence_override is not None else self.min_confidence
-
+    def read(self, plate_crop: np.ndarray) -> tuple[str, float]:
+        """Returns (cleaned_text, confidence) — cleaned_text is "" only when
+        PaddleOCR found no text at all. Never applies a confidence or
+        format threshold; see the module docstring for where that belongs.
+        """
         if plate_crop is None or plate_crop.size == 0:
             return "", 0.0
 
@@ -109,23 +106,6 @@ class PaddleOCRPlateReader(PlateOCR):
         raw_text = "".join(texts)
         confidence = float(min(scores)) if scores else 0.0  # weakest line caps overall confidence
         cleaned = _NON_ALNUM_RE.sub("", raw_text.upper())
-
-        if not cleaned:
-            return "", confidence
-        if confidence < threshold:
-            logger.debug(
-                "Rejecting OCR read %r (conf=%.2f) — below confidence floor %.2f", cleaned, confidence, threshold
-            )
-            return "", confidence
-
-        if self.plate_pattern is not None and not self.plate_pattern.match(cleaned):
-            logger.debug(
-                "Rejecting OCR read %r (conf=%.2f) — doesn't match plate format %s; "
-                "likely non-plate text the detector boxed (signage, etc.)",
-                cleaned, confidence, self.plate_pattern.pattern,
-            )
-            return "", confidence
-
         return cleaned, confidence
 
     @staticmethod

@@ -10,12 +10,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 
 import cv2
 
 from ..interfaces import PlateDetector, PlateOCR, Track, Tracker, VehicleDetector
+from ..ocr.paddle_ocr import DEFAULT_PLATE_PATTERN
 from .aggregator import BestReadingAggregator
 from .annotate import draw_plate, draw_vehicle
 from .events import DetectionEvent
@@ -43,7 +45,9 @@ class PipelineRunner:
         evidence_dir: str = "output/evidence",
         frame_skip: int = 1,
         min_plate_conf_to_ocr: float = 0.25,
+        ocr_min_confidence: float = 0.95,
         ocr_min_confidence_by_class: dict[str, float] | None = None,
+        plate_pattern: re.Pattern | None = DEFAULT_PLATE_PATTERN,
     ):
         self.vehicle_detector = vehicle_detector
         self.plate_detector = plate_detector
@@ -52,14 +56,28 @@ class PipelineRunner:
         self.aggregator = BestReadingAggregator(evidence_dir)
         self.frame_skip = max(1, frame_skip)
         self.min_plate_conf_to_ocr = min_plate_conf_to_ocr
-        # Diagnostic for the motorcycle-accuracy gap found in PR #10's
-        # evaluation (28.57% vs 68.42% for cars): the global 0.95 OCR
-        # confidence floor was tuned against car plates and may be silently
-        # dropping genuine-but-lower-confidence motorcycle reads as "missed"
-        # rather than logging them as low-confidence. e.g.
-        # {"motorcycle": 0.75} tests that hypothesis without touching the
-        # car-tuned default. See cv-service/README.md "Known risks".
+
+        # OCR acceptance (confidence + format) lives here, not inside
+        # PlateOCR (external review — fixed): PlateOCR.read() always
+        # returns raw text/confidence; deciding whether that's "good
+        # enough" is contextual and belongs with the orchestrator, which
+        # also makes offline threshold sweeping trivial (change these
+        # values, no need to reconstruct the OCR object).
+        #
+        # ocr_min_confidence: confirmed on real footage, 0.95 cleanly drops
+        # garbage reads from low-quality track fragments while every
+        # genuine plate read still clears it (0.96-0.9997 on the winning
+        # frame). Trade-off: a genuine plate that never gets a clear enough
+        # frame is silently dropped instead of flagged low-confidence —
+        # watch for this on harder footage (motorbikes, low light).
+        #
+        # ocr_min_confidence_by_class: diagnostic for PR #10's finding
+        # (motorcycle accuracy 28.57% vs car 68.42%) — e.g.
+        # {"motorcycle": 0.75} tests whether the car-tuned 0.95 floor is
+        # silently dropping genuine-but-lower-confidence motorcycle reads.
+        self.ocr_min_confidence = ocr_min_confidence
         self.ocr_min_confidence_by_class = ocr_min_confidence_by_class or {}
+        self.plate_pattern = plate_pattern
 
         self._events: list[DetectionEvent] = []
         self._seen_track_ids: set[int] = set()
@@ -159,36 +177,31 @@ class PipelineRunner:
 
             plate_detections = self.plate_detector.detect(clean_frame, latest.bbox)
             if not plate_detections:
+                self._trace(frame_idx, latest.timestamp_sec, track.track_id, "plate", "none", "no_plate_detected")
                 continue
             # Sorted "own vehicle's plate first, then by confidence" — see
             # the sort key in YoloPlateDetector.detect(), not pure confidence.
             best_plate = plate_detections[0]
             if best_plate.confidence < self.min_plate_conf_to_ocr:
+                self._trace(
+                    frame_idx, latest.timestamp_sec, track.track_id, "plate", "rejected",
+                    f"plate_conf_{best_plate.confidence:.2f}_below_{self.min_plate_conf_to_ocr:.2f}",
+                )
                 continue
+            self._trace(frame_idx, latest.timestamp_sec, track.track_id, "plate", "ok", "")
 
             x1, y1, x2, y2 = best_plate.bbox.to_int_tuple()
             plate_crop = clean_frame[max(0, y1) : max(0, y2), max(0, x1) : max(0, x2)]
-            class_override = self.ocr_min_confidence_by_class.get(track.class_name)
-            try:
-                text, ocr_conf = self.plate_ocr.read(plate_crop, min_confidence_override=class_override)
-            except TypeError:
-                # Not every PlateOCR implementation supports the optional
-                # per-class override (it's not part of the ABC) — fall back.
-                text, ocr_conf = self.plate_ocr.read(plate_crop)
+            text, ocr_conf = self.plate_ocr.read(plate_crop)
             draw_plate(frame, best_plate.bbox, text, ocr_conf)
 
-            # Stage-level trace (per PR #10 external review's suggestion):
-            # completes the "vehicle found -> plate found -> OCR attempted ->
-            # rejected/emitted" chain alongside the detector-level logs, so a
-            # missed ground-truth vehicle's failure point can be found from
-            # logs alone instead of guessed at.
-            logger.debug(
-                "OCR stage: track=%d class=%s -> %r (conf=%.2f, threshold=%s)",
-                track.track_id, track.class_name, text or None, ocr_conf,
-                class_override if class_override is not None else getattr(self.plate_ocr, "min_confidence", "?"),
+            min_confidence = self.ocr_min_confidence_by_class.get(track.class_name, self.ocr_min_confidence)
+            accepted, reject_reason = self._accept_ocr_reading(text, ocr_conf, min_confidence)
+            self._trace(
+                frame_idx, latest.timestamp_sec, track.track_id, "ocr",
+                "ok" if accepted else "rejected", "" if accepted else reject_reason,
             )
-
-            if not text:
+            if not accepted:
                 continue
 
             self.aggregator.offer(
@@ -207,6 +220,29 @@ class PipelineRunner:
 
         for stale_track in self.tracker.get_stale_tracks():
             self._finalize_track(stale_track)
+
+    def _accept_ocr_reading(self, text: str, confidence: float, min_confidence: float) -> tuple[bool, str]:
+        """The acceptance decision PlateOCR itself no longer makes (external
+        review — fixed: OCR returns raw text/confidence, this is the caller's
+        judgment call). Returns (accepted, reason_if_rejected)."""
+        if not text:
+            return False, "no_text_recognized"
+        if confidence < min_confidence:
+            return False, f"confidence_{confidence:.2f}_below_{min_confidence:.2f}"
+        if self.plate_pattern is not None and not self.plate_pattern.match(text):
+            return False, f"format_mismatch_pattern_{self.plate_pattern.pattern}"
+        return True, ""
+
+    def _trace(self, frame_idx: int, timestamp_sec: float, track_id: int, stage: str, outcome: str, reason: str) -> None:
+        """Structured per-track-per-frame record (external review's
+        suggestion): frame, timestamp, track_id, stage, outcome, reason.
+        `grep "track=<id>"` on a DEBUG-level log reconstructs one vehicle's
+        full journey through the pipeline without guessing where it failed.
+        """
+        logger.debug(
+            "TRACE frame=%d t=%.2f track=%d stage=%s outcome=%s reason=%s",
+            frame_idx, timestamp_sec, track_id, stage, outcome, reason,
+        )
 
     def _finalize_track(self, track: Track) -> None:
         reading = self.aggregator.pop(track.track_id)

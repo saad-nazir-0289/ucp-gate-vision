@@ -27,11 +27,17 @@ import cv2
 # `OSError: [WinError 127] ... loading torch\lib\shm.dll`. Don't reorder
 # these imports (or move the paddleocr import to module scope) without
 # re-testing — see cv-service/README.md "Known risks".
+from anpr.config import PipelineConfig
 from anpr.detectors.plate_detector import YoloPlateDetector
 from anpr.detectors.vehicle_detector import YoloVehicleDetector
 from anpr.ocr.paddle_ocr import PaddleOCRPlateReader
 from anpr.pipeline.runner import PipelineRunner
 from anpr.tracking.byte_tracker import ByteTrackTracker
+
+# Single source of truth for defaults (external review — fixed: this file
+# and anpr/config.py had drifted out of sync before). CLI flags below read
+# their `default=` from this instance instead of hardcoding numbers again.
+DEFAULTS = PipelineConfig()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -42,26 +48,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--evidence-dir", default="output/evidence")
     p.add_argument(
         "--vehicle-weights",
-        default="yolov8n.pt",
+        default=DEFAULTS.vehicle_weights,
         help="Ultralytics COCO-pretrained weights (auto-downloaded by ultralytics if not found locally)",
     )
     p.add_argument(
         "--plate-weights",
-        default="models/plate_detector.pt",
+        default=DEFAULTS.plate_weights,
         help="Local path to plate-detector weights — see scripts/download_plate_model.py",
     )
-    p.add_argument("--device", default="cpu", help="'cpu', 'cuda:0', etc.")
+    p.add_argument("--device", default=DEFAULTS.device, help="'cpu', 'cuda:0', etc.")
     p.add_argument(
         "--tracker",
-        default="bytetrack.yaml",
-        help="Ultralytics tracker config name, e.g. 'bytetrack.yaml' (default, fast) or "
-        "'botsort.yaml' (adds appearance-based ReID — more robust across occlusion/gaps, more compute)",
+        default=DEFAULTS.tracker_cfg,
+        help="Ultralytics tracker config name, e.g. 'bytetrack.yaml' (default) or 'botsort.yaml' "
+        "(adds global motion compensation over ByteTrack — NOT appearance ReID by default; "
+        "botsort.yaml ships with with_reid: False, verified against ultralytics' shipped config. "
+        "ReID needs a separate config with with_reid: true, e.g. trackers/botsort_reid.yaml here — "
+        "tested, made no difference for the specific failure it was tried against).",
     )
-    p.add_argument("--frame-skip", type=int, default=1, help="Process every Nth frame (1 = every frame)")
+    p.add_argument("--frame-skip", type=int, default=DEFAULTS.frame_skip, help="Process every Nth frame (1 = every frame)")
     p.add_argument(
         "--imgsz",
         type=int,
-        default=1280,
+        default=DEFAULTS.imgsz,
         help="Ultralytics inference resolution for the vehicle detector. Was implicitly 640 (the "
         "library default) — verified via the external PR #10 review that at 2560x1440 source "
         "frames, 640 shrinks a motorcycle to ~37px before the model sees it. Sweep 640/960/1280.",
@@ -69,17 +78,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--vehicle-conf",
         type=float,
-        default=0.10,
+        default=DEFAULTS.vehicle_conf,
         help="Was 0.35. VERIFIED against ultralytics' bytetrack.yaml: ByteTrack's low-confidence "
         "recovery matches down to track_low_thresh=0.1, but conf=0.35 discarded everything below "
         "that before ByteTrack ever saw it, defeating its signature recovery feature. 0.10 lets "
         "the tracker's own thresholds govern association instead of a blunt upstream filter.",
     )
-    p.add_argument("--plate-conf", type=float, default=0.25)
+    p.add_argument("--plate-conf", type=float, default=DEFAULTS.plate_conf)
     p.add_argument(
         "--ocr-min-conf",
         type=float,
-        default=0.95,
+        default=DEFAULTS.ocr_min_confidence,
         help="Confirmed on real footage: 0.95 cleanly drops garbage reads from low-quality "
         "track fragments while every genuine plate read still clears it (0.96-0.9997 on the "
         "winning frame). Trade-off: a genuine plate that never gets a clear enough frame is "
@@ -117,6 +126,7 @@ def main(argv: list[str] | None = None) -> int:
         conf_threshold=args.vehicle_conf,
         imgsz=args.imgsz,
         tracker_cfg=args.tracker,
+        classes=DEFAULTS.vehicle_classes,
     )
 
     log.info("Loading plate detector (%s) ...", args.plate_weights)
@@ -127,7 +137,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     log.info("Loading PaddleOCR ...")
-    plate_ocr = PaddleOCRPlateReader(min_confidence=args.ocr_min_conf)
+    # No confidence/format params here anymore (external review — fixed):
+    # PlateOCR just reads text; PipelineRunner decides what's acceptable.
+    plate_ocr = PaddleOCRPlateReader()
 
     tracker = ByteTrackTracker(fps=fps / max(1, args.frame_skip))
 
@@ -143,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
         evidence_dir=args.evidence_dir,
         frame_skip=args.frame_skip,
         min_plate_conf_to_ocr=args.plate_conf,
+        ocr_min_confidence=args.ocr_min_conf,
         ocr_min_confidence_by_class=ocr_min_confidence_by_class,
     )
 
