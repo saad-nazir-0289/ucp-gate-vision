@@ -3,7 +3,9 @@
 scripts/ isn't a package (no __init__.py, matching run_pipeline.py's own
 sibling-script convention) — imported via sys.path manipulation.
 """
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,9 +17,11 @@ from score_accuracy import (  # noqa: E402
     character_error_rate,
     edit_distance,
     find_duplicate_events,
+    load_pipeline_events,
     match_events_to_ground_truth,
     normalize_plate,
     normalize_vehicle_type,
+    score,
 )
 
 
@@ -208,6 +212,85 @@ class TestFindDuplicateEvents(unittest.TestCase):
 
         self.assertEqual(exact, [])
         self.assertEqual(near, [])
+
+
+class TestSourceVideoResolution(unittest.TestCase):
+    """Regression tests for the bug that scored a real, correctly-read car
+    as 'Missed' (fix #10 in the module docstring).
+
+    Matching groups by (filename, vehicle_type), so getting the source
+    video wrong doesn't degrade the score — it zeroes it, silently.
+    """
+
+    @staticmethod
+    def _write_events(output_dir: Path, json_name: str, events: list[dict]) -> None:
+        (output_dir / json_name).write_text(json.dumps(events), encoding="utf-8")
+
+    def test_source_video_field_wins_over_the_json_filename(self):
+        """The exact failing case: a run written to `review2_events.json`
+        against `dataset_clear_01.mp4`. The old filename heuristic called
+        this `review2.mp4` and matched nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            self._write_events(out, "review2_events.json", [{
+                "source_video": "dataset_clear_01.mp4",
+                "timestamp_sec": 20.0, "vehicle_class": "car",
+                "plate_text": "AWJ431", "track_id": 3,
+            }])
+
+            events = load_pipeline_events(out)
+
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].filename, "dataset_clear_01.mp4")
+
+    def test_correctly_read_car_scores_correct_not_missed(self):
+        """End-to-end over the real failure: ground truth for
+        dataset_clear_01.mp4, events written to an unrelated JSON name."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            self._write_events(out, "review2_events.json", [{
+                "source_video": "dataset_clear_01.mp4",
+                "timestamp_sec": 20.4, "vehicle_class": "car",
+                "plate_text": "AWJ431", "track_id": 3,
+            }])
+            gt = [GroundTruthRow(
+                index=0, filename="dataset_clear_01.mp4", timestamp_sec=20.0,
+                vehicle_type="car", plate="AWJ431", condition="clear", notes="",
+            )]
+
+            events = load_pipeline_events(out)
+            rows = score(gt, events, match_events_to_ground_truth(gt, events, 5.0))
+
+            self.assertEqual(rows[0].result, "Correct")
+
+    def test_full_path_in_source_video_is_reduced_to_a_basename(self):
+        """ground_truth.csv holds bare filenames; a run invoked with
+        `--video sample_data/dataset_clear_01.mp4` must still match."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            self._write_events(out, "run_events.json", [{
+                "source_video": "sample_data/dataset_clear_01.mp4",
+                "timestamp_sec": 20.0, "vehicle_class": "car",
+                "plate_text": "AWJ431", "track_id": 3,
+            }])
+
+            events = load_pipeline_events(out)
+
+            self.assertEqual(events[0].filename, "dataset_clear_01.mp4")
+
+    def test_falls_back_to_json_filename_for_pre_fix_event_files(self):
+        """Events written before `source_video` existed must still load,
+        using the old heuristic rather than dropping out entirely."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            self._write_events(out, "dataset_clear_01_events.json", [{
+                "timestamp_sec": 20.0, "vehicle_class": "car",
+                "plate_text": "AWJ431", "track_id": 3,
+            }])
+
+            events = load_pipeline_events(out)
+
+            self.assertEqual(events[0].filename, "dataset_clear_01.mp4")
 
 
 if __name__ == "__main__":

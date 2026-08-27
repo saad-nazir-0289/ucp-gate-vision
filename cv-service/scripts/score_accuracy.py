@@ -100,6 +100,22 @@ Two more issues found in a follow-up review of this file specifically
    every report to "candidate duplicate" with the legitimate-reappearance
    explanation stated explicitly, instead of asserting it's a bug.
 
+One more found by actually evaluating a 33-vehicle dataset with it — the
+worst of the lot, because it silently reported a working pipeline as a
+broken one:
+
+10. **The source video was inferred from the events-JSON filename.**
+    `output/review2_events.json` was assumed to be `review2.mp4`. Matching
+    groups by (filename, vehicle_type), so naming an output run anything
+    other than the dataset video meant no event could match any
+    ground-truth row: every row scored "Missed", every correct detection
+    was reported as a false positive, and nothing in the output hinted
+    that filenames were the reason. Fixed at the source — run_pipeline.py
+    now records `source_video` on each event (it knows what it was given;
+    this script was only ever guessing) — plus `warn_on_filename_mismatch`
+    so a non-overlapping filename set is stated outright instead of
+    printing a plausible-looking 0%.
+
 Also handles a real data quirk explicitly: sample_data/README.md notes that
 a blank `plate` value in ground_truth.csv means the plate "wasn't readable
 from human eye." Those rows can't fairly judge OCR *correctness* (there's
@@ -245,16 +261,38 @@ def load_ground_truth(path: Path) -> list[GroundTruthRow]:
 
 
 def load_pipeline_events(output_dir: Path) -> list[PipelineEvent]:
+    """Load events, taking each one's source video from the event itself.
+
+    CRITICAL FIX (this is what made a real, correctly-read car score as
+    "Missed"). This used to derive the source video purely from the
+    events-JSON filename: `review2_events.json` -> `review2.mp4`. Matching
+    then groups by (filename, vehicle_type), so unless a run's output was
+    named exactly after the dataset video, NO event could ever match ANY
+    ground-truth row — every row scored "Missed" and every correct
+    detection was reported as a false positive. Nothing in the output said
+    so; the numbers just looked like a catastrophically bad model.
+
+    `run_pipeline.py` now records `source_video` in each event (the actual
+    `--video` basename), which is where that fact belongs. The filename
+    heuristic is kept only as a fallback for events.json files written
+    before that field existed, and `warn_on_filename_mismatch` below turns
+    the silent-total-miss failure into a loud, explicit message.
+    """
     events: list[PipelineEvent] = []
     for events_path in sorted(output_dir.glob("*_events.json")):
-        filename = events_path.name[: -len("_events.json")] + ".mp4"
+        derived = events_path.name[: -len("_events.json")] + ".mp4"
         with open(events_path, encoding="utf-8") as f:
             data = json.load(f)
+        used_fallback = False
         for raw_event in data:
+            source_video = (raw_event.get("source_video") or "").strip()
+            if not source_video:
+                source_video = derived
+                used_fallback = True
             events.append(
                 PipelineEvent(
                     index=len(events),
-                    filename=filename,
+                    filename=Path(source_video).name,
                     timestamp_sec=float(raw_event.get("timestamp_sec", 0)),
                     vehicle_type=normalize_vehicle_type(raw_event.get("vehicle_class")),
                     plate=normalize_plate(raw_event.get("plate_text")),
@@ -262,7 +300,37 @@ def load_pipeline_events(output_dir: Path) -> list[PipelineEvent]:
                     raw=raw_event,
                 )
             )
+        if used_fallback and data:
+            logger.warning(
+                "%s has events with no 'source_video' field — guessing the source video is %r from "
+                "the JSON filename. If that is not the actual video, every ground-truth row for it "
+                "will score as Missed. Re-run run_pipeline.py to record it properly.",
+                events_path.name, derived,
+            )
     return events
+
+
+def warn_on_filename_mismatch(gt_rows: list[GroundTruthRow], events: list[PipelineEvent]) -> None:
+    """Fail loudly when ground truth and events describe different videos.
+
+    A silent 0% is the single most misleading output this script can
+    produce — it is indistinguishable from a genuinely broken model, and
+    it is exactly what the `source_video` bug above caused. Matching can
+    only ever pair rows within the same filename, so if the two sets of
+    filenames don't intersect, say so instead of printing 100% Missed.
+    """
+    gt_files = {gt.filename for gt in gt_rows}
+    event_files = {ev.filename for ev in events}
+    if gt_files & event_files:
+        return
+    print("=" * 60, file=sys.stderr)
+    print("WARNING: no filename is common to ground truth and pipeline events.", file=sys.stderr)
+    print("Every ground-truth row will score as 'Missed' and every event as a", file=sys.stderr)
+    print("false positive — because matching only ever pairs within one video,", file=sys.stderr)
+    print("not because the pipeline failed. Fix the filenames, then re-score.", file=sys.stderr)
+    print(f"  ground_truth.csv filenames: {sorted(gt_files)}", file=sys.stderr)
+    print(f"  pipeline event filenames:   {sorted(event_files)}", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
 
 
 # ============================================================================
@@ -733,6 +801,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report", type=Path, default=None, help="Optional path to write a markdown report, e.g. docs/ACCURACY_REPORT.md")
     args = parser.parse_args(argv)
 
+    # This report is full of em-dashes and its whole job is to be read. On a
+    # Windows console (cp1252 by default) every one of them renders as a
+    # replacement character, which makes the diagnostic output this script
+    # exists to produce noticeably harder to read.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        except (AttributeError, OSError):
+            pass  # not a reconfigurable text stream (piped/captured) — output is fine as-is
+
     if not args.ground_truth.exists():
         print(f"Ground truth file not found: {args.ground_truth}", file=sys.stderr)
         return 1
@@ -742,6 +820,8 @@ def main(argv: list[str] | None = None) -> int:
     if not events:
         print(f"No *_events.json files found in {args.output_dir} — run run_pipeline.py first.", file=sys.stderr)
         return 1
+
+    warn_on_filename_mismatch(gt_rows, events)
 
     assignments = match_events_to_ground_truth(gt_rows, events, args.time_window)
     duplicates = find_duplicate_events(events, window_sec=args.duplicate_window, max_near_edit_distance=args.duplicate_max_edit_distance)

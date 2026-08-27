@@ -53,7 +53,7 @@ class YoloPlateDetector(PlateDetector):
         frame_edge_margin_px: int = 2,
         min_plate_width_px: int = 24,
         min_plate_height_px: int = 10,
-        min_aspect_ratio: float = 1.0,
+        min_aspect_ratio: float = 0.8,
         max_aspect_ratio: float = 3.0,
     ):
         logger.info("Loading plate detector weights=%s device=%s", weights_path, device)
@@ -91,6 +91,16 @@ class YoloPlateDetector(PlateDetector):
         # correctly OCR'd as text, just not a plate — measured 4.47 (259x58px).
         # Defaults leave generous headroom above/below the observed real
         # range rather than tightly fitting it, since this is a small sample.
+        #
+        # min_aspect_ratio was 1.0, lowered to 0.8 after a 33-vehicle
+        # evaluation missed nearly every motorbike: local motorcycle plates
+        # are stacked two-line and close to square, so a genuine one at a
+        # gate-camera angle can measure just under 1.0 and was being
+        # discarded before OCR ever saw it. The 1.4-1.9 range above came
+        # from car plates plus one motorcycle seen near head-on, which is
+        # the narrowest case, not the representative one. Car plates are
+        # unaffected by the change; the 3.0 upper bound is untouched and
+        # still excludes the 4.47 sign.
         self.min_aspect_ratio = min_aspect_ratio
         self.max_aspect_ratio = max_aspect_ratio
 

@@ -52,16 +52,40 @@ class PipelineConfig:
     plate_iou: float = 0.45
     plate_margin_ratio: float = 0.15  # crop margin around the vehicle box, as a fraction of box size
 
-    # Confirmed on real footage: 0.95 cleanly suppressed a garbage OCR read
-    # from a split-track fragment (a distant/low-quality crop of a car whose
-    # plate was correctly read on a later, better fragment) while every
-    # genuine plate read in testing still cleared it comfortably (0.96-0.9997
-    # on the winning frame). Trade-off: a genuine plate that never gets a
-    # close/clear enough frame to cross 0.95 is now silently dropped rather
-    # than logged as a low-confidence flag for review (FR-5.4 wants the
-    # latter) — worth watching on harder footage (motorbikes, low light) and
-    # dialing back per-gate if it starts suppressing real reads.
-    ocr_min_confidence: float = 0.95
+    # Geometric plate-box filters. These were hardcoded in
+    # YoloPlateDetector.__init__ and unreachable from the CLI, so the one
+    # thing a "no plates detected" investigation most needs to sweep
+    # couldn't be swept without editing code. See the detector's docstrings
+    # for what each measured value they were tuned against was.
+    #
+    # min_plate_aspect_ratio was 1.0, lowered to 0.8: local motorcycle
+    # plates are stacked two-line and close to square, so a genuine one
+    # viewed at a gate-camera angle can measure just under 1.0 and was
+    # being discarded before OCR ever saw it. Cars are unaffected (observed
+    # 1.5-2.0). The upper bound stays at 3.0, which still excludes the
+    # "Entrance" sign false positive measured at 4.47.
+    min_plate_width_px: int = 24
+    min_plate_height_px: int = 10
+    min_plate_aspect_ratio: float = 0.8
+    max_plate_aspect_ratio: float = 3.0
+    # A plate box touching the camera frame edge is likely physically cut
+    # off. Now also backstopped by the plate-format pattern, which rejects
+    # a truncated read ("545") on its own shape — so this can be dialed
+    # down if it turns out to be costing recall at a gate where vehicles
+    # pass close to the frame edge.
+    plate_frame_edge_margin_px: int = 2
+
+    # WAS 0.95. Lowered after a 33-vehicle evaluation came back with almost
+    # every plate missed. 0.95 was tuned against 3 lucky reads on a single
+    # clip and did not survive contact with a real dataset — see the long
+    # comment in PipelineRunner.__init__ and the confirmed OCR numbers in
+    # PaddleOCRPlateReader.read_candidates. In short: it was being applied
+    # to a confidence corrupted by province-band/noise text lines, and even
+    # a clean correct read of a real plate here scored 0.9307. With
+    # candidate selection fixed, the plate-format pattern is the primary
+    # filter and this floor only has to reject plate-shaped garbage
+    # (observed 0.17-0.84, vs 0.93-0.9998 for genuine reads).
+    ocr_min_confidence: float = 0.50
     ocr_lang: str = "en"
 
     track_max_age_frames: int = 30
