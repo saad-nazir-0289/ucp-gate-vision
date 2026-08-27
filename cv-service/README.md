@@ -165,21 +165,34 @@ outright instead of printing a plausible-looking 0%.
 
 Three problems the report surfaces that the changes above do **not** touch:
 
-- **A correct read can be scored as a miss *and* a false positive.**
-  `ABA196` in `dataset_multiple_vehicles_02.mp4` was detected at 14.9s with
-  OCR confidence ~1.00; ground truth labels it at 6.0s. That's outside the
-  5.0s matching window, so it counted as "Missed" *and* was listed as a
-  false-positive event — one correct read, penalized twice. 21 of 33 rows
-  are also flagged ambiguous, and the multi-vehicle clips' ground-truth
-  timestamps are coarse (every row is 6s or 9s). Either the ground-truth
-  timestamps need tightening or `--time-window` needs to reflect how
-  approximate they actually are; scoring is not currently trustworthy at
-  row level on those clips.
-- **Duplicate events inflate the false-positive count.** 9 of the 10
-  reported false positives are second/third detections of a plate that was
-  *also* read correctly (`AWJ431` ×3, `BPG516` ×3, `ASJ765`, `BEW278`,
-  `AED186`, `AAR356`), matching the 10 exact-plate duplicate pairs. The
-  tracker's `_reconcile_id` IoU merge isn't bridging these — see the
+- **Ground-truth timestamps are off by more than the matching window.**
+  The *double-penalty* half of this is fixed: a correct read landing
+  outside the window used to be counted as "Missed" **and** listed as a
+  false positive, describing one correct read as two different failures.
+  `find_timestamp_discrepancies` now reports these in their own section
+  and keeps them out of the false-positive count. Replaying the
+  benchmark's own reported events through the fixed scorer finds **two**
+  such cases, not one: `ABA196` (labeled 6.0s, read correctly at 14.9s,
+  gap +8.9s) and `AUT094` (labeled 43.0s, read correctly at 37.35s, gap
+  −5.6s — barely outside the 5s window, and reported as a detection
+  failure caused by the multi-vehicle scene). Both were also counted among
+  the 10 false positives.
+
+  The underlying data problem is *not* fixed and is not a code question:
+  21 of 33 rows are flagged ambiguous, and the multi-vehicle clips'
+  timestamps are all exactly 6s or 9s. Either the labels need tightening
+  or `--time-window` needs to reflect how approximate they are. Note the
+  accuracy percentages are deliberately unchanged by this fix — matching
+  on plate text and then scoring that match as correct would be grading
+  OCR with its own output as the answer key.
+- **Duplicate events inflate the false-positive count.** With the two
+  mistimed reads above accounted for, the remaining 8 reported false
+  positives are all second/third detections of a plate that was *also*
+  read correctly (`AWJ431` ×3, `BPG516` ×3, `ASJ765`, `BEW278`, `AED186`,
+  `AAR356`), matching the 10 exact-plate duplicate pairs. In other words
+  the benchmark's false-positive count is **not** measuring wrong reads at
+  all — it's measuring tracker dedup failures plus label timing. The
+  tracker's `_reconcile_id` IoU merge isn't bridging these; see the
   ByteTrack ID-stability note under "Known risks".
 - **Bike plate *detection*.** 4 of the 8 missed bikes never produced a
   plate box at all. Nothing in this change affects that.

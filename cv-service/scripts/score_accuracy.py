@@ -116,6 +116,19 @@ broken one:
     so a non-overlapping filename set is stated outright instead of
     printing a plausible-looking 0%.
 
+And one more, from the 33-vehicle benchmark itself:
+
+11. **A correct read could be penalized twice.** `ABA196` was read
+    correctly at 14.9s with ~1.00 confidence; ground truth labels it at
+    6.0s. Outside the 5s window, so it scored as a "Missed" vehicle AND
+    was listed as a false-positive event — one correct read reported as
+    two different failures. `find_timestamp_discrepancies` now identifies
+    these and reports them in their own section, and they no longer
+    inflate the false-positive count. Deliberately a reporting fix, not a
+    matching one: the accuracy percentages are unchanged, because matching
+    on plate text and then scoring that match as correct would be grading
+    OCR with its own output as the answer key.
+
 Also handles a real data quirk explicitly: sample_data/README.md notes that
 a blank `plate` value in ground_truth.csv means the plate "wasn't readable
 from human eye." Those rows can't fairly judge OCR *correctness* (there's
@@ -439,6 +452,56 @@ def match_events_to_ground_truth(
     return assignments
 
 
+def find_timestamp_discrepancies(
+    gt_rows: list[GroundTruthRow], events: list[PipelineEvent], assignments: dict[int, int]
+) -> list[tuple[GroundTruthRow, PipelineEvent]]:
+    """Unmatched ground-truth rows whose exact plate text WAS read, just
+    outside the matching window. Returns (gt_row, event) pairs.
+
+    FIX #11, from the 33-vehicle benchmark. `ABA196` in
+    dataset_multiple_vehicles_02.mp4 was read correctly at 14.9s with OCR
+    confidence ~1.00; ground truth labels that vehicle at 6.0s. 8.9s apart,
+    so with a 5s window it didn't match — and the report then counted it
+    BOTH as a "Missed" vehicle AND as a false-positive event. One correct
+    read, penalized twice, described as two different kinds of failure.
+
+    Deliberately a *reporting* fix, not a matching one: these pairs do NOT
+    become "Correct" and the accuracy percentages are unchanged. Matching
+    on plate text and then scoring that match as a correct read would be
+    circular — grading OCR with OCR's own output as the answer key, which
+    would credit any event whose text happened to equal some plate in the
+    file regardless of when it happened. What is plainly wrong, and is
+    fixed, is calling such an event a *false positive*: it read a real
+    plate belonging to a real labeled vehicle in that clip. Whether the
+    ground-truth timestamp or the window is at fault is a question for
+    whoever labeled the data, so this reports the discrepancy and the size
+    of the gap rather than silently resolving it either way.
+    """
+    matched_event_indices = set(assignments.values())
+    unmatched_events = [ev for ev in events if ev.index not in matched_event_indices and ev.plate]
+    if not unmatched_events:
+        return []
+
+    by_file_plate: dict[tuple[str, str], list[PipelineEvent]] = {}
+    for ev in unmatched_events:
+        by_file_plate.setdefault((ev.filename, ev.plate), []).append(ev)
+
+    claimed: set[int] = set()
+    pairs: list[tuple[GroundTruthRow, PipelineEvent]] = []
+    for gt in gt_rows:
+        if gt.index in assignments or not gt.plate:
+            continue
+        available = [ev for ev in by_file_plate.get((gt.filename, gt.plate), []) if ev.index not in claimed]
+        if not available:
+            continue
+        # Nearest in time, so a plate legitimately appearing twice in one
+        # clip pairs each ground-truth row with its own closest event.
+        best = min(available, key=lambda ev: abs(ev.timestamp_sec - gt.timestamp_sec))
+        claimed.add(best.index)
+        pairs.append((gt, best))
+    return pairs
+
+
 def find_duplicate_events(
     events: list[PipelineEvent], window_sec: float = 5.0, max_near_edit_distance: int = 1
 ) -> tuple[list[tuple[PipelineEvent, PipelineEvent]], list[tuple[PipelineEvent, PipelineEvent]]]:
@@ -536,6 +599,30 @@ def _pct(n: int, d: int) -> float:
     return (n / d * 100) if d else 0.0
 
 
+def _split_false_positives(
+    events: list[PipelineEvent],
+    assignments: dict[int, int],
+    discrepancies: list[tuple[GroundTruthRow, PipelineEvent]],
+) -> tuple[list[PipelineEvent], list[PipelineEvent]]:
+    """Separate genuine false positives from correct reads that just landed
+    outside the matching window (FIX #11 — see find_timestamp_discrepancies).
+
+    A false positive should mean "the pipeline logged a plate that does not
+    correspond to any real vehicle". An event reading `ABA196` in a clip
+    where `ABA196` is a labeled vehicle is not that, whatever its
+    timestamp, and reporting it as one overstates the error rate while
+    hiding a ground-truth/labeling problem.
+    """
+    matched_event_indices = set(assignments.values())
+    out_of_window_indices = {ev.index for _, ev in discrepancies}
+    genuine = [
+        ev for ev in events
+        if ev.index not in matched_event_indices and ev.index not in out_of_window_indices and ev.plate
+    ]
+    out_of_window = [ev for _, ev in discrepancies]
+    return genuine, out_of_window
+
+
 def summarize(rows: list[ScoredRow], key) -> dict[str, dict[str, int]]:
     buckets: dict[str, dict[str, int]] = {}
     for row in rows:
@@ -563,8 +650,8 @@ def print_console_report(
     unreadable = sum(1 for r in rows if not r.scorable)
     ambiguous = sum(1 for r in rows if r.gt.ambiguous)
 
-    matched_event_indices = set(assignments.values())
-    false_positives = [ev for ev in events if ev.index not in matched_event_indices and ev.plate]
+    discrepancies = find_timestamp_discrepancies([r.gt for r in rows], events, assignments)
+    false_positives, out_of_window = _split_false_positives(events, assignments, discrepancies)
 
     print("=" * 60)
     print("OVERALL (excludes ground-truth rows with no human-readable plate)")
@@ -575,7 +662,13 @@ def print_console_report(
     print(f"  Missed:    {missed} ({_pct(missed, total):.2f}%)")
     print(f"Ground-truth rows with illegible plate (scored for detection only): {unreadable}")
     print(f"Ground-truth rows flagged ambiguous (contested match, either direction): {ambiguous}")
-    print(f"Pipeline false-positive events (matched no ground truth): {len(false_positives)}")
+    print(f"Pipeline false-positive events (plate matches no ground-truth row): {len(false_positives)}")
+    if out_of_window:
+        print(
+            f"Correct plate text read OUTSIDE the {time_window}s window: {len(out_of_window)} "
+            f"(counted above as 'Missed', but NOT as false positives — see 'DETECTED OUTSIDE "
+            f"THE MATCHING WINDOW' below)"
+        )
     print(
         f"Candidate duplicate event pairs within {duplicate_window}s: {len(exact_dupes)} exact-plate, "
         f"{len(near_dupes)} near-plate (NOT proof of a bug either way — see 'CANDIDATE DUPLICATE EVENTS' below)"
@@ -608,9 +701,28 @@ def print_console_report(
             print(f"  {r.gt.filename} t={r.gt.timestamp_sec}s  GT={r.gt.plate!r}  got={r.event.plate!r}  CER={r.cer:.2f}")
         print()
 
+    if discrepancies:
+        print("=" * 60)
+        print("DETECTED OUTSIDE THE MATCHING WINDOW")
+        print("=" * 60)
+        print(
+            "The pipeline read these plates EXACTLY right, but too far from the ground-truth\n"
+            "timestamp to match. They are still counted as 'Missed' above (matching on plate\n"
+            "text would mean grading OCR with its own output), but they are NOT false\n"
+            "positives. Either the label's timestamp or --time-window is wrong — check the\n"
+            "gap size below, then fix the ground truth or widen the window and re-score."
+        )
+        for gt, ev in sorted(discrepancies, key=lambda p: -abs(p[1].timestamp_sec - p[0].timestamp_sec)):
+            gap = ev.timestamp_sec - gt.timestamp_sec
+            print(
+                f"  {gt.filename} plate={gt.plate!r} labeled t={gt.timestamp_sec}s, "
+                f"detected t={ev.timestamp_sec}s (gap {gap:+.1f}s, track {ev.track_id})"
+            )
+        print()
+
     if false_positives:
         print("=" * 60)
-        print("FALSE-POSITIVE EVENTS (no matching ground truth)")
+        print("FALSE-POSITIVE EVENTS (plate matches no ground-truth row in that file)")
         print("=" * 60)
         for ev in false_positives:
             print(f"  {ev.filename} t={ev.timestamp_sec}s track={ev.track_id} class={ev.vehicle_type} plate={ev.plate!r}")
@@ -638,13 +750,22 @@ def print_console_report(
         print()
 
 
-def write_results_csv(rows: list[ScoredRow], path: Path) -> None:
+def write_results_csv(
+    rows: list[ScoredRow],
+    path: Path,
+    discrepancies: list[tuple[GroundTruthRow, PipelineEvent]] | None = None,
+) -> None:
+    # gt_index -> seconds between the label and the correct-but-unmatched
+    # read, so a "Missed" row that was actually read right is visible in the
+    # per-row CSV, not only in the report prose (FIX #11).
+    gaps = {gt.index: ev.timestamp_sec - gt.timestamp_sec for gt, ev in (discrepancies or [])}
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(
             ["filename", "timestamp_sec", "vehicle_type", "condition", "ground_truth_plate",
-             "detected_plate", "result", "cer", "ambiguous_ground_truth"]
+             "detected_plate", "result", "cer", "ambiguous_ground_truth",
+             "detected_outside_window_gap_sec"]
         )
         for r in rows:
             writer.writerow(
@@ -652,6 +773,7 @@ def write_results_csv(rows: list[ScoredRow], path: Path) -> None:
                     r.gt.filename, r.gt.timestamp_sec, r.gt.vehicle_type, r.gt.condition,
                     r.gt.plate, r.event.plate if r.event else "", r.result,
                     f"{r.cer:.3f}" if r.cer is not None else "", r.gt.ambiguous,
+                    f"{gaps[r.gt.index]:+.2f}" if r.gt.index in gaps else "",
                 ]
             )
 
@@ -671,8 +793,8 @@ def write_markdown_report(
     incorrect = sum(1 for r in scorable if r.result == "Incorrect")
     missed = sum(1 for r in scorable if r.result == "Missed")
     total = len(scorable)
-    matched_event_indices = set(assignments.values())
-    false_positives = [ev for ev in events if ev.index not in matched_event_indices and ev.plate]
+    discrepancies = find_timestamp_discrepancies([r.gt for r in rows], events, assignments)
+    false_positives, out_of_window = _split_false_positives(events, assignments, discrepancies)
 
     lines = [
         "# ANPR Accuracy Evaluation Report",
@@ -694,7 +816,9 @@ def write_markdown_report(
         f"- Ground-truth rows flagged **ambiguous** (a contested match within {time_window}s — either "
         f"2+ events competed for this row, or its matched event was also wanted by another row): "
         f"{sum(1 for r in rows if r.gt.ambiguous)}",
-        f"- False-positive pipeline events (matched no ground truth): {len(false_positives)}",
+        f"- False-positive pipeline events (plate matches no ground-truth row in that file): {len(false_positives)}",
+        f"- Correct plate text read **outside** the {time_window}s matching window: {len(out_of_window)} "
+        f"— counted as \"Missed\" above, but not as false positives; see below",
         f"- Candidate duplicate event pairs within {duplicate_window}s: {len(exact_dupes)} exact-plate, "
         f"{len(near_dupes)} near-plate — a signal, not proof of a bug; see below",
         f"- Matching time window: {time_window}s",
@@ -725,8 +849,29 @@ def write_markdown_report(
         for r in missed_rows:
             lines.append(f"| {r.gt.filename} | {r.gt.timestamp_sec}s | {r.gt.vehicle_type} | `{r.gt.plate}` |")
 
+    if discrepancies:
+        lines += [
+            "",
+            "## Detected Outside the Matching Window",
+            "",
+            "The pipeline read these plates **exactly right**, but too far from the ground-truth "
+            "timestamp to match. They are still counted as \"Missed\" above — matching on plate text "
+            "would mean grading OCR with its own output as the answer key — but they are **not** "
+            "false positives. Either the label's timestamp or `--time-window` is wrong; check the "
+            "gap, then fix the ground truth or widen the window and re-score.",
+            "",
+            "| File | Plate | Labeled at | Detected at | Gap | Track |",
+            "|---|---|---:|---:|---:|---:|",
+        ]
+        for gt, ev in sorted(discrepancies, key=lambda p: -abs(p[1].timestamp_sec - p[0].timestamp_sec)):
+            gap = ev.timestamp_sec - gt.timestamp_sec
+            lines.append(
+                f"| {gt.filename} | `{gt.plate}` | {gt.timestamp_sec}s | {ev.timestamp_sec}s | "
+                f"{gap:+.1f}s | {ev.track_id} |"
+            )
+
     if false_positives:
-        lines += ["", "## False-Positive Events (no matching ground truth)", "", "| File | t | Track | Class | Plate |", "|---|---:|---:|---|---|"]
+        lines += ["", "## False-Positive Events (plate matches no ground-truth row in that file)", "", "| File | t | Track | Class | Plate |", "|---|---:|---:|---|---|"]
         for ev in false_positives:
             lines.append(f"| {ev.filename} | {ev.timestamp_sec}s | {ev.track_id} | {ev.vehicle_type} | `{ev.plate}` |")
 
@@ -833,7 +978,7 @@ def main(argv: list[str] | None = None) -> int:
     print_console_report(rows, events, assignments, duplicates, args.time_window, args.duplicate_window)
 
     results_csv = args.results_csv or (args.output_dir / "accuracy_results.csv")
-    write_results_csv(rows, results_csv)
+    write_results_csv(rows, results_csv, find_timestamp_discrepancies(gt_rows, events, assignments))
     print(f"Detailed results written to: {results_csv}")
 
     if args.report:

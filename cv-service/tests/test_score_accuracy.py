@@ -17,12 +17,14 @@ from score_accuracy import (  # noqa: E402
     character_error_rate,
     edit_distance,
     find_duplicate_events,
+    find_timestamp_discrepancies,
     load_pipeline_events,
     match_events_to_ground_truth,
     normalize_plate,
     normalize_vehicle_type,
     score,
 )
+from score_accuracy import _split_false_positives  # noqa: E402
 
 
 class TestNormalizeVehicleType(unittest.TestCase):
@@ -291,6 +293,97 @@ class TestSourceVideoResolution(unittest.TestCase):
             events = load_pipeline_events(out)
 
             self.assertEqual(events[0].filename, "dataset_clear_01.mp4")
+
+
+class TestTimestampDiscrepancies(unittest.TestCase):
+    """FIX #11 — the ABA196 case from the 33-vehicle benchmark: a correct
+    read counted as BOTH a missed vehicle and a false positive."""
+
+    @staticmethod
+    def _gt(index, plate, t, filename="dataset_multiple_vehicles_02.mp4", vtype="car"):
+        return GroundTruthRow(
+            index=index, filename=filename, timestamp_sec=t, vehicle_type=vtype,
+            plate=plate, condition="day", notes="",
+        )
+
+    @staticmethod
+    def _ev(index, plate, t, track_id, filename="dataset_multiple_vehicles_02.mp4", vtype="car"):
+        return PipelineEvent(
+            index=index, filename=filename, timestamp_sec=t, vehicle_type=vtype,
+            plate=plate, track_id=track_id,
+        )
+
+    def test_the_real_aba196_case_is_identified(self):
+        gt = [self._gt(0, "ABA196", 6.0)]
+        events = [self._ev(0, "ABA196", 14.9, 21)]
+        assignments = match_events_to_ground_truth(gt, events, 5.0)
+
+        self.assertEqual(assignments, {}, "8.9s apart must not match on a 5s window")
+        discrepancies = find_timestamp_discrepancies(gt, events, assignments)
+
+        self.assertEqual(len(discrepancies), 1)
+        self.assertEqual(discrepancies[0][0].plate, "ABA196")
+        self.assertAlmostEqual(discrepancies[0][1].timestamp_sec, 14.9)
+
+    def test_such_an_event_is_not_reported_as_a_false_positive(self):
+        gt = [self._gt(0, "ABA196", 6.0)]
+        events = [self._ev(0, "ABA196", 14.9, 21)]
+        assignments = match_events_to_ground_truth(gt, events, 5.0)
+        discrepancies = find_timestamp_discrepancies(gt, events, assignments)
+
+        genuine, out_of_window = _split_false_positives(events, assignments, discrepancies)
+
+        self.assertEqual(genuine, [], "reading a real labeled plate is not a false positive")
+        self.assertEqual(len(out_of_window), 1)
+
+    def test_accuracy_is_deliberately_unchanged(self):
+        """Reporting fix only. Scoring it 'Correct' would grade OCR using
+        its own output as the matching key."""
+        gt = [self._gt(0, "ABA196", 6.0)]
+        events = [self._ev(0, "ABA196", 14.9, 21)]
+        assignments = match_events_to_ground_truth(gt, events, 5.0)
+
+        rows = score(gt, events, assignments)
+
+        self.assertEqual(rows[0].result, "Missed")
+
+    def test_a_genuinely_spurious_plate_is_still_a_false_positive(self):
+        gt = [self._gt(0, "ABA196", 6.0)]
+        events = [self._ev(0, "ZZZ999", 14.9, 21)]
+        assignments = match_events_to_ground_truth(gt, events, 5.0)
+        discrepancies = find_timestamp_discrepancies(gt, events, assignments)
+
+        genuine, out_of_window = _split_false_positives(events, assignments, discrepancies)
+
+        self.assertEqual([ev.plate for ev in genuine], ["ZZZ999"])
+        self.assertEqual(out_of_window, [])
+
+    def test_same_plate_twice_in_one_clip_pairs_each_row_with_its_nearest_event(self):
+        """dataset_clear_01.mp4 genuinely has AXP625 entering at 48s and
+        leaving at 60s — each label must claim its own event, not both
+        collapse onto one."""
+        gt = [self._gt(0, "AXP625", 48.0, "dataset_clear_01.mp4"),
+              self._gt(1, "AXP625", 60.0, "dataset_clear_01.mp4")]
+        events = [self._ev(0, "AXP625", 75.0, 5, "dataset_clear_01.mp4"),
+                  self._ev(1, "AXP625", 90.0, 9, "dataset_clear_01.mp4")]
+
+        discrepancies = find_timestamp_discrepancies(gt, events, {})
+
+        self.assertEqual(len(discrepancies), 2)
+        self.assertEqual({d[1].index for d in discrepancies}, {0, 1}, "one event may not serve two rows")
+
+    def test_matched_rows_produce_no_discrepancy(self):
+        gt = [self._gt(0, "ABA196", 6.0)]
+        events = [self._ev(0, "ABA196", 7.0, 21)]
+        assignments = match_events_to_ground_truth(gt, events, 5.0)
+
+        self.assertEqual(find_timestamp_discrepancies(gt, events, assignments), [])
+
+    def test_different_files_never_pair(self):
+        gt = [self._gt(0, "ABA196", 6.0, "dataset_multiple_vehicles_02.mp4")]
+        events = [self._ev(0, "ABA196", 6.5, 21, "dataset_clear_01.mp4")]
+
+        self.assertEqual(find_timestamp_discrepancies(gt, events, {}), [])
 
 
 if __name__ == "__main__":
