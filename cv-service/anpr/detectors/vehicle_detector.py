@@ -11,6 +11,15 @@ from ..interfaces import BBox, Detection, VehicleDetector
 
 logger = logging.getLogger(__name__)
 
+# COCO bus/truck — included defensively alongside car/motorcycle. A
+# car-like vehicle (SUV, van, sedan at an odd angle) can get misclassified
+# as bus/truck by a generic COCO-pretrained model; without these classes
+# that vehicle is silently dropped entirely rather than logged under the
+# "wrong" class. Downstream consumers (e.g. accuracy scoring) should treat
+# bus/truck as "car" for matching purposes rather than a separate category.
+COCO_BUS = 5
+COCO_TRUCK = 7
+
 
 class YoloVehicleDetector(VehicleDetector):
     """Vehicle detector + persistent track-ID assignment.
@@ -40,16 +49,35 @@ class YoloVehicleDetector(VehicleDetector):
         self,
         weights: str = "yolov8n.pt",
         device: str = "cpu",
-        conf_threshold: float = 0.35,
+        # Was 0.35. VERIFIED against ultralytics' shipped bytetrack.yaml:
+        # ByteTrack's second-stage recovery matches detections down to
+        # track_low_thresh=0.1 — a strength specifically meant to survive
+        # motion blur / partial occlusion / a hard viewing angle without
+        # losing the track. Passing conf=0.35 into .track() discards every
+        # detection below that *before ByteTrack ever sees it*, so its
+        # low-confidence recovery never gets anything to recover with.
+        # 0.10 matches track_low_thresh so the tracker's own thresholds (not
+        # a blunt upstream filter) govern association; its new_track_thresh
+        # (0.25) still guards against noise starting spurious new tracks.
+        conf_threshold: float = 0.10,
         iou_threshold: float = 0.5,
+        # Was implicitly 640 (ultralytics' default when unset). Our source
+        # frames are 2560x1440 — at 640 a motorcycle occupying ~150px in the
+        # original frame shrinks to ~37px before the model ever sees it.
+        # 1280 keeps meaningfully more detail at roughly 1.5-2x the
+        # inference cost of 640, not the 4x a full-resolution pass would
+        # cost. Sweep 640/960/1280 against real accuracy data — this default
+        # is a reasoned starting point, not a validated optimum.
+        imgsz: int = 1280,
         tracker_cfg: str = "bytetrack.yaml",
-        classes: tuple[int, ...] = (COCO_CAR, COCO_MOTORCYCLE),
+        classes: tuple[int, ...] = (COCO_CAR, COCO_MOTORCYCLE, COCO_BUS, COCO_TRUCK),
     ):
-        logger.info("Loading vehicle detector weights=%s device=%s", weights, device)
+        logger.info("Loading vehicle detector weights=%s device=%s imgsz=%d", weights, device, imgsz)
         self.model = YOLO(weights)
         self.device = device
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
+        self.imgsz = imgsz
         self.tracker_cfg = tracker_cfg
         self.classes = list(classes)
         names = getattr(self.model, "names", {}) or {}
@@ -62,6 +90,7 @@ class YoloVehicleDetector(VehicleDetector):
             classes=self.classes,
             conf=self.conf_threshold,
             iou=self.iou_threshold,
+            imgsz=self.imgsz,
             tracker=self.tracker_cfg,
             device=self.device,
             verbose=False,
@@ -89,5 +118,14 @@ class YoloVehicleDetector(VehicleDetector):
                     class_name=self._class_names.get(int(cid), str(int(cid))),
                     track_id=int(tid) if tid is not None else None,
                 )
+            )
+        # Stage-level trace (per suggestion in the PR #10 external review):
+        # lets a per-vehicle "found -> ... -> emitted" trace be reconstructed
+        # from logs alone when diagnosing a missed ground-truth vehicle.
+        if detections:
+            logger.debug(
+                "Vehicle stage: %d detection(s): %s",
+                len(detections),
+                [(d.class_name, round(d.confidence, 2), d.track_id) for d in detections],
             )
         return detections

@@ -15,6 +15,32 @@ from ..interfaces import BBox, Detection, PlateDetector
 logger = logging.getLogger(__name__)
 
 
+def sort_plate_candidates(detections: list[Detection], vehicle_box: BBox) -> list[Detection]:
+    """Sort so `detections[0]` is the right vehicle's own plate, not just the
+    highest-confidence plate anywhere in the margin-expanded crop.
+
+    FIX (per PR #10 external review): in a crowded scene, the margin region
+    around vehicle A's box can contain vehicle B's plate — if B's plate
+    happens to score higher confidence than A's own (partially occluded/
+    angled) plate, a plain "highest confidence wins" sort would hand A's
+    track vehicle B's plate text. A plate whose center actually falls inside
+    the vehicle's own (unexpanded) box is preferred regardless of
+    confidence; only if none do do we fall back to the margin region,
+    highest-confidence first.
+
+    Pulled out as a standalone function (not just an inline sort in
+    detect()) so it's unit-testable without loading a real YOLO model —
+    see cv-service/tests/test_plate_detector.py.
+    """
+
+    def _key(d: Detection) -> tuple[bool, float]:
+        cx, cy = (d.bbox.x1 + d.bbox.x2) / 2, (d.bbox.y1 + d.bbox.y2) / 2
+        inside_vehicle_box = vehicle_box.x1 <= cx <= vehicle_box.x2 and vehicle_box.y1 <= cy <= vehicle_box.y2
+        return (not inside_vehicle_box, -d.confidence)  # False (inside) sorts before True; then by confidence desc
+
+    return sorted(detections, key=_key)
+
+
 class YoloPlateDetector(PlateDetector):
     def __init__(
         self,
@@ -27,7 +53,7 @@ class YoloPlateDetector(PlateDetector):
         frame_edge_margin_px: int = 2,
         min_plate_width_px: int = 24,
         min_plate_height_px: int = 10,
-        min_aspect_ratio: float = 1.0,
+        min_aspect_ratio: float = 0.8,
         max_aspect_ratio: float = 3.0,
     ):
         logger.info("Loading plate detector weights=%s device=%s", weights_path, device)
@@ -65,6 +91,16 @@ class YoloPlateDetector(PlateDetector):
         # correctly OCR'd as text, just not a plate — measured 4.47 (259x58px).
         # Defaults leave generous headroom above/below the observed real
         # range rather than tightly fitting it, since this is a small sample.
+        #
+        # min_aspect_ratio was 1.0, lowered to 0.8 after a 33-vehicle
+        # evaluation missed nearly every motorbike: local motorcycle plates
+        # are stacked two-line and close to square, so a genuine one at a
+        # gate-camera angle can measure just under 1.0 and was being
+        # discarded before OCR ever saw it. The 1.4-1.9 range above came
+        # from car plates plus one motorcycle seen near head-on, which is
+        # the narrowest case, not the representative one. Car plates are
+        # unaffected by the change; the 3.0 upper bound is untouched and
+        # still excludes the 4.47 sign.
         self.min_aspect_ratio = min_aspect_ratio
         self.max_aspect_ratio = max_aspect_ratio
 
@@ -133,8 +169,12 @@ class YoloPlateDetector(PlateDetector):
                 )
             )
 
-        # Highest confidence first — callers that just want "the" plate can take detections[0].
-        detections.sort(key=lambda d: d.confidence, reverse=True)
+        detections = sort_plate_candidates(detections, vehicle_box)
+        if detections:
+            logger.debug(
+                "Plate stage: %d candidate(s) for vehicle_box=%s, picked %s (conf=%.2f)",
+                len(detections), vehicle_box.to_int_tuple(), detections[0].bbox.to_int_tuple(), detections[0].confidence,
+            )
         return detections
 
     def _crop_with_margin(self, frame: np.ndarray, vehicle_box: BBox):

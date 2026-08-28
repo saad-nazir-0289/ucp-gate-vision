@@ -61,7 +61,174 @@ Outputs land in `output/` by default:
 
 Each event is also printed to stdout as JSON as it's finalized (i.e. as soon as a vehicle leaves frame or the video ends), so you can watch detections happen live in the console.
 
-Useful flags (`python run_pipeline.py --help` for the full list): `--device cuda:0` (GPU), `--frame-skip 2` (process every 2nd frame — see NFR-4/CPU fallback in `docs/ARCHITECTURE.md` section 8), `--vehicle-conf`, `--plate-conf`, `--ocr-min-conf` (confidence thresholds).
+Useful flags (`python run_pipeline.py --help` for the full list): `--device cuda:0` (GPU), `--frame-skip 2` (process every 2nd frame — see NFR-4/CPU fallback in `docs/ARCHITECTURE.md` section 8), `--vehicle-conf`, `--plate-conf`, `--ocr-min-conf` (confidence thresholds), and the `--plate-min-*`/`--plate-*-aspect`/`--plate-edge-margin` geometry filters.
+
+Each run ends with a **rejection breakdown** — where plate reads were lost
+(`no_plate_detected`, `format_mismatch`, `confidence_below_threshold`, …) as a
+share of all attempts. Read it before tuning: it distinguishes "the plate was
+never found" from "the plate was read correctly and then thrown away on a
+threshold," which are the same from the events file alone and were the reason
+a 33-vehicle evaluation's near-total miss rate went misdiagnosed (see below).
+
+## The 33-vehicle evaluation: what was actually wrong (found and fixed)
+
+The hand-labeled 33-vehicle evaluation (`sample_data/ground_truth.csv`,
+three clips; results in
+[`docs/ACCURACY_REPORT_MSNUPDATED_33.md`](../docs/ACCURACY_REPORT_MSNUPDATED_33.md))
+measured **66.67% correct overall — cars 89.47%, bikes 35.71%**. The
+headline problem is the car/bike gap, not a pipeline that reads nothing:
+
+| Type | Total | Correct | Incorrect | Missed | Accuracy |
+|---|---:|---:|---:|---:|---:|
+| car | 19 | 17 | 0 | 2 | 89.47% |
+| bike | 14 | 5 | 1 | 8 | 35.71% |
+
+Of the 8 missed bikes, the report attributes 4 to "plate was not detected"
+and 3 to "plate detected, but OCR failed". The fixes below target that
+second group and are the reason to expect the bike number to move; they do
+**not** address plate *detection* on fast/small bikes, which is still open.
+
+Three bugs, each confirmed against real output from this project's own
+footage rather than reasoned about:
+
+**1. Every OCR text line in a plate crop was glued into one string.**
+`PaddleOCRPlateReader.read()` did `"".join(rec_texts)`. Local plates carry a
+province band ("PUNJAB") above the number, and OCR also picks up stray
+noise, so a crop routinely produces two text lines. Real captured output:
+
+```
+rec_texts  = ['BUV 711', 'JUNJAU']     # 'JUNJAU' is the PUNJAB band, misread
+rec_scores = [0.9988,    0.6661]
+```
+
+The plate number was read **perfectly at 0.9988**. Joining produced
+`'BUV711JUNJAU'`, which fails the plate-format regex — so a correct read was
+discarded as a format mismatch.
+
+**2. Confidence was `min()` over all those lines.** The same join gave that
+perfect read a confidence of 0.6661. Worse with a noise speck:
+`['ARK2363', 'n']` scoring `[0.9909, 0.1747]` handed a 0.99 plate read to the
+threshold check as **0.17**. So each read was being killed twice over, by two
+independent mechanisms, and the run output couldn't tell you either had
+happened.
+
+Fixed by replacing "join everything, take the worst score" with *candidate
+selection*: `PlateOCR.read_candidates()` enumerates each individual line plus
+each contiguous run of lines joined in **visual** order (top-to-bottom —
+PaddleOCR's returned order does not track layout, confirmed on two crops of
+the same plate where the band came back first in one and second in the
+other), and `PipelineRunner._select_reading` picks the best candidate that
+matches the plate format. This is why it can't simply be "take the
+highest-confidence line": a genuinely stacked two-line plate
+(`['GAA', '545']`) must still join, while `['BUV 711', 'JUNJAU']` must not.
+The plate-format pattern is the only signal that separates those two cases,
+so it is applied *before* the confidence floor.
+
+**3. `--ocr-min-conf` defaulted to 0.95, which was never justified.** It was
+tuned against 3 lucky reads on one clip. Besides being applied to the
+corrupted confidence above, it's too tight even on a clean read: `'BUV 711'`
+scored **0.9307** on a genuine, correct read of a real plate here. Lowered to
+**0.50**. With candidate selection fixed the format pattern does the real
+filtering (it rejects province bands, `ENTRANCE`, and truncated reads like
+`545` on shape alone), leaving this floor to catch only plate-shaped garbage
+— observed noise sits at 0.17–0.84, genuine reads at 0.93–0.9998.
+
+**Measured effect** — re-running OCR over the archived evidence crops, every
+read the old code accepted is still accepted with identical text (no
+regressions), and five previously-discarded reads now come back correct:
+`JUNJAUBUV711@0.67 → BUV711@0.9988`, `7UNJASBUV711@0.77 → BUV711@0.9991`,
+`PUNJAJBUV711@0.84 → BUV711@0.9977`, `ARK2363N@0.17 → ARK2363@0.9909`, and
+`BUV711@0.93` (rejected purely by the 0.95 floor) now accepted.
+
+**4. The scorer inferred the source video from the events-JSON filename.**
+`scripts/score_accuracy.py` mapped `output/review2_events.json` →
+`review2.mp4`, then matched ground truth grouped by
+`(filename, vehicle_type)`. Ground truth says `dataset_clear_01.mp4`. When
+the filename sets don't intersect, **every** ground-truth row scores
+"Missed" and **every** correct detection is reported as a false positive —
+with no hint in the output that filenames were the cause. Reproduced on
+this repo's checked-in `output/*_events.json`: 33 vehicles, 100% missed, 9
+false positives.
+
+**This did not cause the 33-vehicle result** — that run's outputs were
+named after the dataset clips, so matching worked. It's a live trap for
+anyone who names an output run after the branch or the experiment instead
+of the video, not the explanation for any number in the report above.
+
+Fixed at the source: `run_pipeline.py` now records `source_video` on each
+event (it knows what it was given; the scorer was only ever guessing), the
+old heuristic remains as a fallback for pre-fix event files, and
+`warn_on_filename_mismatch` now states a non-overlapping filename set
+outright instead of printing a plausible-looking 0%.
+
+### Still open after these fixes
+
+Three problems the report surfaces that the changes above do **not** touch:
+
+- **Ground-truth timestamps are off by more than the matching window.**
+  The *double-penalty* half of this is fixed: a correct read landing
+  outside the window used to be counted as "Missed" **and** listed as a
+  false positive, describing one correct read as two different failures.
+  `find_timestamp_discrepancies` now reports these in their own section
+  and keeps them out of the false-positive count. Replaying the
+  benchmark's own reported events through the fixed scorer finds **two**
+  such cases, not one: `ABA196` (labeled 6.0s, read correctly at 14.9s,
+  gap +8.9s) and `AUT094` (labeled 43.0s, read correctly at 37.35s, gap
+  −5.6s — barely outside the 5s window, and reported as a detection
+  failure caused by the multi-vehicle scene). Both were also counted among
+  the 10 false positives.
+
+  The underlying data problem is *not* fixed and is not a code question:
+  21 of 33 rows are flagged ambiguous, and the multi-vehicle clips'
+  timestamps are all exactly 6s or 9s. Either the labels need tightening
+  or `--time-window` needs to reflect how approximate they are. Note the
+  accuracy percentages are deliberately unchanged by this fix — matching
+  on plate text and then scoring that match as correct would be grading
+  OCR with its own output as the answer key.
+- **Duplicate events inflate the false-positive count.** With the two
+  mistimed reads above accounted for, the remaining 8 reported false
+  positives are all second/third detections of a plate that was *also*
+  read correctly (`AWJ431` ×3, `BPG516` ×3, `ASJ765`, `BEW278`, `AED186`,
+  `AAR356`), matching the 10 exact-plate duplicate pairs. In other words
+  the benchmark's false-positive count is **not** measuring wrong reads at
+  all — it's measuring tracker dedup failures plus label timing. The
+  tracker's `_reconcile_id` IoU merge isn't bridging these; see the
+  ByteTrack ID-stability note under "Known risks".
+- **Bike plate *detection*.** 4 of the 8 missed bikes never produced a
+  plate box at all. Nothing in this change affects that.
+
+**Diagnosing the next run.** The reason the OCR bugs took a full evaluation
+to spot is that "no plate found" and "plate read correctly then thrown away
+on a threshold" looked identical from the outside. `run_pipeline.py` now ends with
+a rejection breakdown — how many attempts died at `no_plate_detected`,
+`format_mismatch`, `confidence_below_threshold`, etc., and what the top
+reason means. Check it before tuning anything. The plate-box geometry filters
+(`--plate-min-width/height`, `--plate-min-aspect`, `--plate-max-aspect`,
+`--plate-edge-margin`) are also CLI flags now rather than hardcoded
+constructor defaults, so a `no_plate_detected`-dominated run can be swept
+without editing code.
+
+**Still unverified** — the dataset clips aren't in this repo (see
+`sample_data/README.md`), so the fixes above are confirmed against archived
+evidence crops and unit tests, **not** against a full re-run of the 33-vehicle
+set. The 66.67% / 89.47% / 35.71% figures above are the numbers **before**
+these fixes; nobody has measured after. Re-run and re-score before quoting
+any accuracy number:
+
+```bash
+python run_pipeline.py --video sample_data/dataset_clear_01.mp4 \
+  --events-json output/dataset_clear_01_events.json \
+  --evidence-dir output/dataset_clear_01_evidence
+python scripts/score_accuracy.py --report docs/ACCURACY_REPORT.md
+```
+
+One hypothesis in this area is *not* confirmed: `--plate-min-aspect` was
+lowered from 1.0 to 0.8 on the reasoning that local motorbike plates are
+stacked two-line and near-square, so genuine ones at a gate-camera angle
+could measure just under 1.0 and be discarded before OCR ever saw them. The
+motorcycle plates measurable here ran 1.55–1.72, which doesn't demonstrate
+the problem. Treat it as a widened guard rail, and check the rejection
+summary to see whether plate *detection* is actually a bottleneck.
 
 ## Known risks / design trade-offs
 
@@ -74,7 +241,7 @@ Useful flags (`python run_pipeline.py --help` for the full list): `--device cuda
 - **Best-OCR-confidence frame isn't always the most complete read (found and fixed):** observed on the same test clip — a track's plate was fully legible ("AAL 988") in an earlier frame (OCR confidence 0.94), but a later frame where the plate crop was clipped by the bottom image edge scored *higher* OCR confidence (0.9999) on the truncated text "988" alone. Since `BestReadingAggregator` picks strictly by highest `ocr_confidence`, it kept the truncated read over the complete one for that finalized event. Fixed at the source: `YoloPlateDetector.detect()` now rejects any plate box that touches the camera frame's own edge (not the vehicle crop's edge — see the `frame_edge_margin_px` check), since that box is very likely physically cut off. Re-tested: the truncated "988" read no longer occurs; the same track now finalizes on the complete "AAL988" reading. This is a same-frame geometric heuristic, not a content-aware "is this plate actually complete" check, so a plate that's genuinely fully visible but happens to sit right at the frame edge would also be rejected — an acceptable trade-off for now.
 - **Same vehicle logged as two separate detection events (found and fixed):** confirmed on the same test clip — the same physical car and the same physical motorcycle each produced two separate detection events under two different track IDs, because ByteTrack's own track either wasn't "confirmed" yet (reporting no ID for the first few frames, so our IoU fallback assigned a temporary one) or got briefly lost and re-acquired under a new real ID mid-pass. Fixed with a same-video, in-memory reconciliation heuristic in `ByteTrackTracker._reconcile_id`: whenever a brand-new track ID appears with no existing track entry, check currently-active tracks for a high-IoU (≥0.5) match against its box; if found, merge histories and prefer a real ByteTrack ID as canonical over a fallback one. `BestReadingAggregator.migrate()` carries over the better-scoring accumulated reading so nothing is lost across the merge. Re-tested: both vehicles now produce exactly one event each. This is an IoU-proximity heuristic, not true appearance-based re-identification — it can't bridge a gap longer than `max_age_frames` (30 frames / ~1.5s by default), and two *different* vehicles that happen to overlap heavily at the merge instant could theoretically be wrongly fused. Real cross-track dedup spanning longer gaps (e.g. a vehicle leaving and re-entering frame) is still Phase 2 scope, per `docs/ARCHITECTURE.md` section 2.1's short-TTL dedup cache.
 - **Minor cosmetic loose end from the merge fix:** when a fallback/absorbed track ID is merged away, its evidence images already written to disk under the old ID (e.g. `track_1000000_frame.jpg`) aren't deleted — they just become orphaned files not referenced by the final `events.json`. Harmless, not cleaned up.
-- **Plate detector false-positives on non-plate rectangular text (found and fixed):** on a second test clip, the detector boxed an "Entrance" sign in the scene and OCR correctly read it as `"ENTRANCE"` (conf 0.9999) — a real detection and a real OCR read, just not a plate. Fixed with two complementary checks, since neither alone is sufficient: (1) an aspect-ratio filter in `YoloPlateDetector` (`min_aspect_ratio`/`max_aspect_ratio`, defaults 1.0–3.0) — every genuine plate box measured so far is ~1.4–1.9 width:height, the "Entrance" sign's box was 4.47; (2) a plate-format regex in `PaddleOCRPlateReader` (`DEFAULT_PLATE_PATTERN = ^[A-Z]{2,4}[0-9]{2,4}$`) — every genuine plate read normalizes to letters-then-digits, `"ENTRANCE"` is pure letters. Re-tested: the false positive is gone; the pipeline now finds and correctly reads the real plate (`GAA545`) on the actual vehicle in that frame instead. Both are heuristics tuned to the plate formats/framing observed so far, not content-aware "is this actually a plate" understanding — a different plate format (e.g. different letter/digit counts) needs `DEFAULT_PLATE_PATTERN` adjusted, and `min_aspect_ratio`/`max_aspect_ratio` may need retuning for other camera angles.
+- **Plate detector false-positives on non-plate rectangular text (found and fixed):** on a second test clip, the detector boxed an "Entrance" sign in the scene and OCR correctly read it as `"ENTRANCE"` (conf 0.9999) — a real detection and a real OCR read, just not a plate. Fixed with two complementary checks, since neither alone is sufficient: (1) an aspect-ratio filter in `YoloPlateDetector` (`min_aspect_ratio`/`max_aspect_ratio`, now 0.8–3.0, see the 33-vehicle section above for why the lower bound moved off 1.0) — every genuine plate box measured so far is ~1.4–1.9 width:height, the "Entrance" sign's box was 4.47; (2) a plate-format regex in `PaddleOCRPlateReader` (`DEFAULT_PLATE_PATTERN = ^[A-Z]{2,4}[0-9]{2,4}$`), applied by `PipelineRunner` — every genuine plate read normalizes to letters-then-digits, `"ENTRANCE"` is pure letters. That regex turned out to carry far more weight than intended: it is also the signal that separates a plate number from the province band glued onto it, and is now the pipeline's primary OCR filter. Re-tested: the false positive is gone; the pipeline now finds and correctly reads the real plate (`GAA545`) on the actual vehicle in that frame instead. Both are heuristics tuned to the plate formats/framing observed so far, not content-aware "is this actually a plate" understanding — a different plate format (e.g. different letter/digit counts) needs `DEFAULT_PLATE_PATTERN` adjusted, and `min_aspect_ratio`/`max_aspect_ratio` may need retuning for other camera angles.
 - **ByteTrack ID stability under occlusion/longer gaps — not fully solved:** the merge fix above only bridges gaps up to `max_age_frames` (~1.5s default). For more robust re-identification across longer gaps, Ultralytics' BoT-SORT tracker (adds appearance-based ReID on top of Kalman+IoU) is a one-line config swap (`tracker_cfg="botsort.yaml"` instead of `"bytetrack.yaml"`) since the tracker is already selected via config — not yet tried. Trade-off: extra compute per frame on a pipeline that's already too slow for NFR-1 on CPU (see performance note below).
 
 ## Real test runs (input footage: campus gate camera, 2560×1440 @ 20fps)
@@ -103,5 +270,5 @@ Get at least one clip with **cars only**, then a **separate** clip with **motorc
 3. Compare against `output/events.json`:
    - **Detection recall** — did every vehicle pass produce exactly one event (no missed vehicles, no duplicate events for one pass)?
    - **OCR accuracy** — for each event, does `plate_text` exactly match (or come close — note common confusions like `0`/`O`, `1`/`I`) the real plate? Track this **separately for cars vs. motorbikes** per the placeholder targets in `docs/PROJECT_SPEC.md` section 5 (cars >90%, motorbikes >75%) — treat those as targets to validate against, not assumed truths.
-   - **Confidence calibration** — do low `ocr_confidence` events correlate with actually-wrong reads? If high-confidence reads are frequently wrong, the confidence threshold (`--ocr-min-conf`) needs raising.
+   - **Confidence calibration** — do low `ocr_confidence` events correlate with actually-wrong reads? If high-confidence reads are frequently wrong, the confidence threshold (`--ocr-min-conf`) needs raising. Raise it on evidence of *wrong reads being accepted*, not on a hunch that higher is safer: the 0.95 default that preceded the current 0.50 was set that way and silently discarded correct reads scoring 0.93.
 4. If plate *detection* (not OCR) is the weak link — boxes missing plates entirely, or landing on the wrong region — that's the moment to swap `--plate-weights` for a different pretrained model rather than proceeding to Phase 2 with a broken foundation (per the kickoff doc's Phase 1 tip: cheaper to swap now than after Phases 2-5 are built around it).

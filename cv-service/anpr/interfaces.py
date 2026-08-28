@@ -116,11 +116,44 @@ class PlateDetector(ABC):
         raise NotImplementedError
 
 
+@dataclass
+class PlateReading:
+    """One candidate interpretation of a plate crop's text.
+
+    A plate crop routinely contains more than just the plate number: local
+    plates carry a province/city band ("PUNJAB"), and OCR also picks up
+    stray noise fragments. Each of those comes back as its own text line,
+    so "what does this crop say" has several possible answers, not one.
+    `source_lines` records how many OCR text lines were concatenated to
+    form this candidate (1 for a single line, 2+ for a genuinely two-line
+    plate whose letters and digits are stacked).
+    """
+
+    text: str
+    confidence: float
+    source_lines: int = 1
+
+
 class PlateOCR(ABC):
     @abstractmethod
     def read(self, plate_crop: np.ndarray) -> tuple[str, float]:
         """Read the plate string from a cropped plate image. Returns (text, confidence)."""
         raise NotImplementedError
+
+    def read_candidates(self, plate_crop: np.ndarray) -> list[PlateReading]:
+        """Every plausible reading of this crop, best-confidence first.
+
+        Exists because a single (text, confidence) pair can't express a
+        multi-line crop faithfully — see PlateReading. The caller
+        (PipelineRunner) picks between candidates using its own
+        plate-format policy, keeping the accept/reject decision out of the
+        OCR layer exactly as `read()`'s contract already does.
+
+        Default implementation wraps `read()`, so a PlateOCR that only
+        knows how to return one answer keeps working unchanged.
+        """
+        text, confidence = self.read(plate_crop)
+        return [PlateReading(text=text, confidence=confidence)] if text else []
 
 
 class Tracker(ABC):
