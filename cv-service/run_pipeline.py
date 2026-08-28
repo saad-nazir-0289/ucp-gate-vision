@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 
 import cv2
@@ -31,7 +32,7 @@ import cv2
 from anpr.config import PipelineConfig
 from anpr.detectors.plate_detector import YoloPlateDetector
 from anpr.detectors.vehicle_detector import YoloVehicleDetector
-from anpr.ocr.paddle_ocr import PaddleOCRPlateReader
+from anpr.ocr.paddle_ocr import DEFAULT_PLATE_PATTERN, PaddleOCRPlateReader
 from anpr.pipeline.runner import PipelineRunner
 from anpr.tracking.byte_tracker import ByteTrackTracker
 
@@ -122,12 +123,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     plate_geom.add_argument("--plate-max-aspect", type=float, default=DEFAULTS.max_plate_aspect_ratio)
     plate_geom.add_argument(
+        "--plate-imgsz",
+        type=int,
+        default=DEFAULTS.plate_imgsz,
+        help="Inference resolution for the PLATE pass (separate from --imgsz, which is the vehicle "
+        "pass). Was never set, so ultralytics used its 640 default on every vehicle crop: fine for a "
+        "small distant crop (upscaled) but it DOWNSCALES a large close crop, losing detail on the "
+        "most readable plates. Unset by default so behaviour is unchanged and comparable; a sweep "
+        "over real frames had 640 and 960 each winning on different crops, so measure rather than "
+        "guess. Try 640/960/1280.",
+    )
+    plate_geom.add_argument(
         "--plate-edge-margin",
         type=int,
         default=DEFAULTS.plate_frame_edge_margin_px,
         help="Reject plate boxes within this many px of the camera frame edge (likely physically "
         "truncated). Now backstopped by the plate-format pattern, which rejects a truncated read "
         "like '545' on its own shape — lower it if this is costing recall at your gate.",
+    )
+    p.add_argument(
+        "--plate-pattern",
+        default=None,
+        help="Regex a candidate OCR reading must match to be accepted, overriding "
+        "DEFAULT_PLATE_PATTERN in anpr/ocr/paddle_ocr.py. This is the pipeline's PRIMARY OCR "
+        "filter (it is what separates a plate number from the province band OCR glues onto it), "
+        "so widen it deliberately: anything it rejects is dropped with no event. Pass 'none' to "
+        "disable format filtering entirely.",
     )
     p.add_argument("--log-level", default="INFO")
     return p
@@ -175,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
         min_plate_height_px=args.plate_min_height,
         min_aspect_ratio=args.plate_min_aspect,
         max_aspect_ratio=args.plate_max_aspect,
+        imgsz=args.plate_imgsz,
     )
 
     log.info("Loading PaddleOCR ...")
@@ -188,6 +210,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.ocr_min_conf_motorcycle is not None:
         ocr_min_confidence_by_class["motorcycle"] = args.ocr_min_conf_motorcycle
 
+    plate_pattern = DEFAULT_PLATE_PATTERN
+    if args.plate_pattern is not None:
+        plate_pattern = None if args.plate_pattern.strip().lower() == "none" else re.compile(args.plate_pattern)
+        log.info("Using plate pattern override: %s", args.plate_pattern)
+
     runner = PipelineRunner(
         vehicle_detector=vehicle_detector,
         plate_detector=plate_detector,
@@ -198,6 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         min_plate_conf_to_ocr=args.plate_conf,
         ocr_min_confidence=args.ocr_min_conf,
         ocr_min_confidence_by_class=ocr_min_confidence_by_class,
+        plate_pattern=plate_pattern,
         # Recorded into every event so scripts/score_accuracy.py matches
         # ground truth on the actual source video rather than inferring it
         # from the events-JSON filename — that inference silently scored a

@@ -12,18 +12,34 @@ logger = logging.getLogger(__name__)
 
 _NON_ALNUM_RE = re.compile(r"[^A-Z0-9]")
 
-# Every genuine plate read confirmed on real footage normalizes to letters
-# followed by digits, nothing else (e.g. AAL988, BAG9976, BUV711, ARK2363).
-# Non-plate text the detector occasionally boxes (signage, "#11 car 0.39"
-# style overlay artifacts) doesn't fit this shape — e.g. "ENTRANCE" is pure
-# letters, no digits at all. This is a content-based filter *on top of* the
-# detector's geometric filters (edge/size/aspect-ratio in
-# anpr/detectors/plate_detector.py), not a replacement for them — catches
-# false positives whose box geometry looks plate-like but whose text doesn't.
-# Tune/replace for plate formats outside 2-4 letters + 2-4 digits. Lives
-# here (not in PlateOCR) since it's a acceptance decision, applied by
-# whoever calls read() — see PipelineRunner.
-DEFAULT_PLATE_PATTERN = re.compile(r"^[A-Z]{2,4}[0-9]{2,4}$")
+# The plate-format filter. This carries far more weight than its size
+# suggests: it is the pipeline's PRIMARY OCR filter, and the only signal
+# separating a plate number from the province band OCR glues onto it
+# (see PaddleOCRPlateReader.read_candidates). It also rejects non-plate
+# signage ("ENTRANCE" — pure letters) and truncated reads ("545" — pure
+# digits) on shape alone.
+#
+# WIDENED from ^[A-Z]{2,4}[0-9]{2,4}$. All 33 plates in
+# sample_data/ground_truth.csv fit that narrower shape, but 33 plates from
+# two gates is a small sample to hard-code a silent discard rule against:
+# anything it doesn't match is dropped with no event and no review flag.
+# Older/other local formats, and plates carrying a city or series prefix,
+# use separators and different group lengths. The pattern below still
+# demands letters-then-digits (which is what does the actual work) but
+# stops assuming the exact group counts.
+#
+# An optional trailing-letter suffix was tried here and REVERTED: it let
+# 'ARK2363N' back through — the real ['ARK2363', 'n'] noise-fragment case
+# from this project's footage. Candidate ordering would still have picked
+# the right one (a joined candidate can never outscore its own best line),
+# but there is no evidence local plates carry a trailing letter, so there
+# is no reason to spend the safety margin on it.
+#
+# Configurable per deployment: pass `plate_pattern=` to PipelineRunner, or
+# --plate-pattern on the CLI. Set it to None to disable format filtering
+# entirely — but read read_candidates() first, because without this the
+# province band comes back as part of the plate text.
+DEFAULT_PLATE_PATTERN = re.compile(r"^[A-Z]{1,4}[0-9]{1,5}$")
 
 
 class PaddleOCRPlateReader(PlateOCR):

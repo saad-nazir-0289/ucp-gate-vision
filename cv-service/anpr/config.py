@@ -74,6 +74,9 @@ class PipelineConfig:
     # down if it turns out to be costing recall at a gate where vehicles
     # pass close to the frame edge.
     plate_frame_edge_margin_px: int = 2
+    # Inference resolution for the plate pass. None = leave ultralytics at
+    # its 640 default (unchanged behaviour). See --plate-imgsz.
+    plate_imgsz: int | None = None
 
     # WAS 0.95. Lowered after a 33-vehicle evaluation came back with almost
     # every plate missed. 0.95 was tuned against 3 lucky reads on a single

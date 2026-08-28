@@ -204,8 +204,15 @@ class PipelineRunner:
 
             plate_detections = self.plate_detector.detect(clean_frame, latest.bbox)
             if not plate_detections:
-                self._trace(frame_idx, latest.timestamp_sec, track.track_id, "plate", "none", "no_plate_detected")
-                self._reject_reasons["no_plate_detected"] += 1
+                # Distinguish "the detector saw nothing" from "the detector
+                # found a box and a geometric filter discarded it" — those
+                # need opposite fixes (a better/retrained model vs. a
+                # threshold), and both used to surface here identically.
+                # Not part of the PlateDetector ABC, so read defensively.
+                filtered = list(getattr(self.plate_detector, "last_reject_reasons", ()) or ())
+                reason = filtered[0] if filtered else "no_plate_detected"
+                self._trace(frame_idx, latest.timestamp_sec, track.track_id, "plate", "none", reason)
+                self._reject_reasons[reason] += 1
                 continue
             # Sorted "own vehicle's plate first, then by confidence" — see
             # the sort key in YoloPlateDetector.detect(), not pure confidence.

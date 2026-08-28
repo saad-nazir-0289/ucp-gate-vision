@@ -55,6 +55,7 @@ class YoloPlateDetector(PlateDetector):
         min_plate_height_px: int = 10,
         min_aspect_ratio: float = 0.8,
         max_aspect_ratio: float = 3.0,
+        imgsz: int | None = None,
     ):
         logger.info("Loading plate detector weights=%s device=%s", weights_path, device)
         self.model = YOLO(weights_path)
@@ -103,20 +104,41 @@ class YoloPlateDetector(PlateDetector):
         # still excludes the 4.47 sign.
         self.min_aspect_ratio = min_aspect_ratio
         self.max_aspect_ratio = max_aspect_ratio
+        # Inference resolution for the plate pass. Was never set at all, so
+        # ultralytics silently used its 640 default on every vehicle crop —
+        # which UPSCALES a small distant crop (196x199 -> 640, helpful) but
+        # DOWNSCALES a large close one (960x540 -> 640), throwing away detail
+        # on exactly the vehicles whose plates are most readable. Left as
+        # None (= keep the 640 default) rather than changed on a hunch: a
+        # sweep over real frames showed 640 and 960 each winning on different
+        # crops, so this needs measuring on your own footage, not a new
+        # guessed constant. That is what got --ocr-min-conf stuck at 0.95.
+        # Sweep it with --plate-imgsz.
+        self.imgsz = imgsz
+        # Why candidate boxes were discarded on the most recent detect()
+        # call. Without this, every geometric rejection surfaced to the
+        # runner as a bare empty list and got counted as "no_plate_detected"
+        # — conflating "the detector saw nothing at all" with "the detector
+        # found a plate and we threw it away for being 1px too small". Those
+        # need completely different fixes, so they are counted separately.
+        self.last_reject_reasons: list[str] = []
 
     def detect(self, frame: np.ndarray, vehicle_box: BBox) -> list[Detection]:
+        self.last_reject_reasons = []
         frame_h, frame_w = frame.shape[:2]
         crop, offset_x, offset_y = self._crop_with_margin(frame, vehicle_box)
         if crop is None or crop.size == 0:
             return []
 
-        results = self.model.predict(
-            crop,
+        predict_kwargs = dict(
             conf=self.conf_threshold,
             iou=self.iou_threshold,
             device=self.device,
             verbose=False,
         )
+        if self.imgsz:
+            predict_kwargs["imgsz"] = self.imgsz
+        results = self.model.predict(crop, **predict_kwargs)
         detections: list[Detection] = []
         if not results:
             return detections
@@ -140,6 +162,7 @@ class YoloPlateDetector(PlateDetector):
                     "bbox=(%.0f,%.0f,%.0f,%.0f) frame=%dx%d",
                     abs_x1, abs_y1, abs_x2, abs_y2, frame_w, frame_h,
                 )
+                self.last_reject_reasons.append("plate_box_touches_frame_edge")
                 continue
 
             box_w, box_h = abs_x2 - abs_x1, abs_y2 - abs_y1
@@ -148,6 +171,7 @@ class YoloPlateDetector(PlateDetector):
                     "Skipping plate detection too small to be legible: %.0fx%.0fpx (min %dx%dpx)",
                     box_w, box_h, self.min_plate_width_px, self.min_plate_height_px,
                 )
+                self.last_reject_reasons.append("plate_box_too_small")
                 continue
 
             aspect_ratio = box_w / box_h if box_h > 0 else float("inf")
@@ -157,6 +181,7 @@ class YoloPlateDetector(PlateDetector):
                     "(allowed %.1f-%.1f)",
                     box_w, box_h, aspect_ratio, self.min_aspect_ratio, self.max_aspect_ratio,
                 )
+                self.last_reject_reasons.append("plate_box_bad_aspect_ratio")
                 continue
 
             class_name = names.get(int(cid), self.default_class_name) if isinstance(names, dict) else self.default_class_name
