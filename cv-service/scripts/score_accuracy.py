@@ -249,6 +249,13 @@ class PipelineEvent:
     vehicle_type: str
     plate: str
     track_id: int
+    # The confidence the pipeline accepted this reading at. Surfaced in the
+    # report because without it an "Incorrect" row cannot be acted on: a wrong
+    # read at 0.55 is a threshold that is too loose, a wrong read at 0.99 is a
+    # model problem, and those need opposite responses. The V2 benchmark
+    # (60.61%, down from 66.67% after --ocr-min-conf was lowered 0.95 -> 0.50)
+    # could not distinguish them.
+    ocr_confidence: float = 0.0
     raw: dict = field(default_factory=dict)
 
 
@@ -310,6 +317,7 @@ def load_pipeline_events(output_dir: Path) -> list[PipelineEvent]:
                     vehicle_type=normalize_vehicle_type(raw_event.get("vehicle_class")),
                     plate=normalize_plate(raw_event.get("plate_text")),
                     track_id=raw_event.get("track_id", -1),
+                    ocr_confidence=float(raw_event.get("ocr_confidence", 0.0) or 0.0),
                     raw=raw_event,
                 )
             )
@@ -500,6 +508,110 @@ def find_timestamp_discrepancies(
         claimed.add(best.index)
         pairs.append((gt, best))
     return pairs
+
+
+def sweep_ocr_confidence(
+    gt_rows: list[GroundTruthRow],
+    events: list[PipelineEvent],
+    time_window: float,
+    thresholds: list[float],
+) -> list[dict]:
+    """Re-score at several --ocr-min-conf floors, offline, from one run's events.
+
+    Why this exists. --ocr-min-conf was set to 0.95 on three lucky reads from
+    one clip, then lowered to 0.50 on three archived evidence crops. The second
+    change halved misses (10 -> 5) but multiplied wrong reads (1 -> 8) and took
+    overall accuracy DOWN, 66.67% -> 60.61%. Both numbers were picked from a
+    handful of examples because measuring the alternative meant a full
+    multi-hour pipeline re-run per candidate value.
+
+    It does not. Raising the floor can only ever REMOVE already-accepted
+    readings, so every threshold at or above the one a run used can be
+    simulated by filtering that run's own events and re-running the match. One
+    pipeline run, the whole curve.
+
+    The floor is a recall/precision dial: raising it turns wrong reads back
+    into misses. Which is better is a policy question -- for a banned-vehicle
+    alert a miss is far worse than a flagged uncertain read -- so this reports
+    the trade-off rather than declaring a winner.
+
+    Only valid at or above the run's own floor: lower thresholds would need
+    readings the pipeline never recorded, so those rows are marked accordingly.
+    """
+    results: list[dict] = []
+    for threshold in sorted(thresholds):
+        kept = [ev for ev in events if ev.ocr_confidence >= threshold]
+        # Re-index so the matcher's assignment dict keys stay consistent.
+        reindexed = [
+            PipelineEvent(
+                index=i, filename=ev.filename, timestamp_sec=ev.timestamp_sec,
+                vehicle_type=ev.vehicle_type, plate=ev.plate, track_id=ev.track_id,
+                ocr_confidence=ev.ocr_confidence, raw=ev.raw,
+            )
+            for i, ev in enumerate(kept)
+        ]
+        for gt in gt_rows:
+            gt.ambiguous = False  # recomputed per threshold by the matcher
+        assignments = match_events_to_ground_truth(gt_rows, reindexed, time_window)
+        rows = score(gt_rows, reindexed, assignments)
+        scorable = [r for r in rows if r.scorable]
+        by_type: dict[str, dict[str, int]] = {}
+        for r in scorable:
+            b = by_type.setdefault(r.gt.vehicle_type, {"Correct": 0, "Incorrect": 0, "Missed": 0})
+            b[r.result] += 1
+        matched = set(assignments.values())
+        results.append({
+            "threshold": threshold,
+            "events_kept": len(kept),
+            "correct": sum(1 for r in scorable if r.result == "Correct"),
+            "incorrect": sum(1 for r in scorable if r.result == "Incorrect"),
+            "missed": sum(1 for r in scorable if r.result == "Missed"),
+            "total": len(scorable),
+            "false_positives": sum(1 for ev in reindexed if ev.index not in matched and ev.plate),
+            "by_type": by_type,
+        })
+    return results
+
+
+def print_sweep(results: list[dict], run_floor: float | None) -> None:
+    print("=" * 78)
+    print("OCR CONFIDENCE SWEEP")
+    print("=" * 78)
+    print(
+        "Simulated by filtering THIS run's events, so it is only valid at or above the\n"
+        "floor the run actually used (raising a floor can only remove readings; lowering\n"
+        "one needs readings that were never recorded). Re-run the pipeline at the lowest\n"
+        "floor you want to consider, then sweep upward from there.\n"
+    )
+    header = f"{'floor':>6} {'events':>7} {'correct':>8} {'wrong':>6} {'missed':>7} {'acc%':>7} {'FP':>4}"
+    per_type = sorted({t for r in results for t in r["by_type"]})
+    for t in per_type:
+        header += f" {t[:8] + ' acc%':>13}"
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        flag = " " if run_floor is None or r["threshold"] >= run_floor else "!"
+        line = (
+            f"{r['threshold']:>6.2f}{flag}{r['events_kept']:>6} {r['correct']:>8} {r['incorrect']:>6} "
+            f"{r['missed']:>7} {_pct(r['correct'], r['total']):>6.2f}% {r['false_positives']:>4}"
+        )
+        for t in per_type:
+            b = r["by_type"].get(t)
+            tot = sum(b.values()) if b else 0
+            line += f" {(_pct(b['Correct'], tot) if b else 0.0):>12.2f}%"
+        print(line)
+    if run_floor is not None:
+        print(f"\n! = below this run's own --ocr-min-conf ({run_floor}); not simulable, ignore.")
+    best = max(results, key=lambda r: r["correct"])
+    print(
+        f"\nMost correct reads at floor {best['threshold']:.2f}: {best['correct']}/{best['total']} "
+        f"({_pct(best['correct'], best['total']):.2f}%)."
+    )
+    print(
+        "Pick on policy, not just this column: raising the floor converts wrong reads into\n"
+        "misses. For banned-vehicle alerting a miss is worse than a flagged uncertain read."
+    )
+    print()
 
 
 def find_duplicate_events(
@@ -698,7 +810,10 @@ def print_console_report(
         print("INCORRECT READS (with Character Error Rate)")
         print("=" * 60)
         for r in sorted(incorrect_rows, key=lambda r: r.cer or 0):
-            print(f"  {r.gt.filename} t={r.gt.timestamp_sec}s  GT={r.gt.plate!r}  got={r.event.plate!r}  CER={r.cer:.2f}")
+            print(
+                f"  {r.gt.filename} t={r.gt.timestamp_sec}s  GT={r.gt.plate!r}  got={r.event.plate!r}  "
+                f"CER={r.cer:.2f}  ocr_conf={r.event.ocr_confidence:.3f}"
+            )
         print()
 
     if discrepancies:
@@ -725,7 +840,10 @@ def print_console_report(
         print("FALSE-POSITIVE EVENTS (plate matches no ground-truth row in that file)")
         print("=" * 60)
         for ev in false_positives:
-            print(f"  {ev.filename} t={ev.timestamp_sec}s track={ev.track_id} class={ev.vehicle_type} plate={ev.plate!r}")
+            print(
+                f"  {ev.filename} t={ev.timestamp_sec}s track={ev.track_id} class={ev.vehicle_type} "
+                f"plate={ev.plate!r} ocr_conf={ev.ocr_confidence:.3f}"
+            )
         print()
 
     if exact_dupes or near_dupes:
@@ -839,9 +957,20 @@ def write_markdown_report(
 
     incorrect_rows = [r for r in scorable if r.result == "Incorrect"]
     if incorrect_rows:
-        lines += ["", "## Incorrect Reads (with Character Error Rate)", "", "| File | t | Ground Truth | Detected | CER |", "|---|---:|---|---|---:|"]
+        lines += [
+            "", "## Incorrect Reads (with Character Error Rate)", "",
+            "`OCR conf` is the confidence the pipeline accepted the wrong reading at. It decides "
+            "what to do about the row: a wrong read at low confidence means `--ocr-min-conf` is too "
+            "loose, a wrong read at high confidence means the threshold is irrelevant and the model "
+            "or the crop is at fault. Use `--sweep-ocr-conf` to pick the floor from this data.",
+            "",
+            "| File | t | Ground Truth | Detected | CER | OCR conf |", "|---|---:|---|---|---:|---:|",
+        ]
         for r in sorted(incorrect_rows, key=lambda r: r.cer or 0):
-            lines.append(f"| {r.gt.filename} | {r.gt.timestamp_sec}s | `{r.gt.plate}` | `{r.event.plate}` | {r.cer:.2f} |")
+            lines.append(
+                f"| {r.gt.filename} | {r.gt.timestamp_sec}s | `{r.gt.plate}` | `{r.event.plate}` | "
+                f"{r.cer:.2f} | {r.event.ocr_confidence:.3f} |"
+            )
 
     missed_rows = [r for r in scorable if r.result == "Missed"]
     if missed_rows:
@@ -871,9 +1000,12 @@ def write_markdown_report(
             )
 
     if false_positives:
-        lines += ["", "## False-Positive Events (plate matches no ground-truth row in that file)", "", "| File | t | Track | Class | Plate |", "|---|---:|---:|---|---|"]
+        lines += ["", "## False-Positive Events (plate matches no ground-truth row in that file)", "", "| File | t | Track | Class | Plate | OCR conf |", "|---|---:|---:|---|---|---:|"]
         for ev in false_positives:
-            lines.append(f"| {ev.filename} | {ev.timestamp_sec}s | {ev.track_id} | {ev.vehicle_type} | `{ev.plate}` |")
+            lines.append(
+                f"| {ev.filename} | {ev.timestamp_sec}s | {ev.track_id} | {ev.vehicle_type} | "
+                f"`{ev.plate}` | {ev.ocr_confidence:.3f} |"
+            )
 
     if exact_dupes or near_dupes:
         lines += [
@@ -942,6 +1074,16 @@ def main(argv: list[str] | None = None) -> int:
         "--duplicate-max-edit-distance", type=int, default=1,
         help="Max character difference still counted as a 'near' duplicate (0 = exact-plate only).",
     )
+    parser.add_argument(
+        "--sweep-ocr-conf", nargs="*", type=float, default=None, metavar="FLOOR",
+        help="Re-score at several --ocr-min-conf floors offline, from this run's events, and print "
+        "the accuracy/miss trade-off curve. No pipeline re-run needed. Pass explicit values, or no "
+        "values for a default sweep. Only valid at or above the floor the run itself used.",
+    )
+    parser.add_argument(
+        "--run-ocr-min-conf", type=float, default=None,
+        help="The --ocr-min-conf the run used, so the sweep can mark thresholds it cannot simulate.",
+    )
     parser.add_argument("--results-csv", type=Path, default=None, help="Default: <output-dir>/accuracy_results.csv")
     parser.add_argument("--report", type=Path, default=None, help="Optional path to write a markdown report, e.g. docs/ACCURACY_REPORT.md")
     args = parser.parse_args(argv)
@@ -976,6 +1118,19 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Pipeline events:       {len(events)}")
     print()
     print_console_report(rows, events, assignments, duplicates, args.time_window, args.duplicate_window)
+
+    if args.sweep_ocr_conf is not None:
+        thresholds = args.sweep_ocr_conf or [0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.97, 0.99]
+        print_sweep(
+            sweep_ocr_confidence(gt_rows, events, args.time_window, thresholds),
+            args.run_ocr_min_conf,
+        )
+        # Matching mutated the ambiguity flags during the sweep; recompute for the
+        # main report so its numbers match a plain, unswept run exactly.
+        for gt in gt_rows:
+            gt.ambiguous = False
+        assignments = match_events_to_ground_truth(gt_rows, events, args.time_window)
+        rows = score(gt_rows, events, assignments)
 
     results_csv = args.results_csv or (args.output_dir / "accuracy_results.csv")
     write_results_csv(rows, results_csv, find_timestamp_discrepancies(gt_rows, events, assignments))
