@@ -54,6 +54,58 @@ motorcycle-shaped crops fail hardest — consistent with the bike gap.
 4. Then direction inference (decision 9)
 5. Backend as specced (decision 11)
 
+## V2 benchmark: the reported regression was a measurement artifact
+
+`ACCURACY_REPORT_MSNUPDATED_33_V2.md` reported 66.67% -> 60.61% after the OCR
+fixes. Running the confidence sweep and coverage diagnostic against that run's
+own event files shows otherwise.
+
+**`--ocr-min-conf` is not the cause.** Correct reads stay flat at 20/33 across
+every floor from 0.50 to 0.99; raising it only converts wrong reads into
+misses. Five of the eight wrong reads sit at >=0.90 confidence, three above
+0.998. Reverting to 0.95 would not have restored 66.67%.
+
+**Four rows were lost to timestamp matching.** `--coverage` shows 24 of 33
+plates were read *exactly* right somewhere in their clip against a headline of
+20. Ground-truth labels sit 2-6s later than the frame the pipeline reads the
+plate on (a human labels when the vehicle reaches the gate; the pipeline reads
+it on approach). `AFA6610` is labeled 3.0s and read at 0.00s; `AUT094` labeled
+43.0s, read at 36.75s.
+
+**Four more were high-confidence truncations.** `LEE8980` read as `LEE18` at
+0.9997, `LEN9009` as `LEN08`, `LEN910` as `LEN18`, `AZE335` as `AE335`. Every
+plate in the ground truth is 6-7 characters, so a 5-character read is a
+truncation. `min_plate_text_length = 6` (decision 13) removes all four.
+
+Re-scoring the same V2 events with both applied:
+
+| | correct | wrong | cars | wrong car reads |
+|---|---:|---:|---:|---:|
+| as reported (5s window, no min length) | 20 (60.61%) | 8 | 84.21% | 2 |
+| + `--time-window 10` | 23 (69.70%) | 7 | 89.47% | 2 |
+| + min 6 chars | 20 (60.61%) | 4 | 84.21% | **0** |
+| **both** | **24 (72.73%)** | **3** | **94.74%** | **0** |
+
+72.73% is exactly the plate-read ceiling — every plate the pipeline read
+correctly is now credited. V1's baseline was 66.67% / 89.47% / 35.71%, so V2
+beats it on every axis once measured properly.
+
+**13. Minimum plate-text length = 6** — added as a result. Configurable via
+`--min-plate-chars`; set 0 to disable. Kept separate from the plate-format
+regex so diagnostics can distinguish "wrong shape" from "truncated".
+
+### What is genuinely left
+
+Isolated from the measurement noise, the real failures are:
+
+- **Never read at all:** `LEN9009`, `LEE8980`, `LEM5133`, `APM7367`, `LER7662`
+  (4 bikes, 1 car)
+- **Read within 1-2 characters:** `LEM2025` -> `LEM2024`, `LEN910` -> `LEN18`,
+  `LRK4645` -> `LRX4645`, `LEX127` -> `BEX127`
+
+Only **one car** (`LEE8980`) is a genuine read failure. The fine-tune
+(decisions 1-3) is now a *bike* problem, not a car one.
+
 ## Known-weak, deliberately deferred
 
 **Ground truth** is the measurement instrument for every decision above, and

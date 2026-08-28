@@ -89,6 +89,14 @@ class PipelineConfig:
     # filter and this floor only has to reject plate-shaped garbage
     # (observed 0.17-0.84, vs 0.93-0.9998 for genuine reads).
     ocr_min_confidence: float = 0.50
+    # Minimum characters in an accepted plate reading. Every plate in
+    # sample_data/ground_truth.csv is 6-7 characters, so a shorter reading is a
+    # truncation. Measured on the V2 benchmark: this removes four high-
+    # confidence truncated misreads that no confidence threshold could reach
+    # (LEE8980 -> "LEE18" at 0.9997, LEN9009 -> "LEN08", LEN910 -> "LEN18",
+    # AZE335 -> "AE335"), taking wrong car reads to zero. Lower it for a
+    # deployment with genuinely shorter plates.
+    min_plate_text_length: int = 6
     ocr_lang: str = "en"
 
     track_max_age_frames: int = 30

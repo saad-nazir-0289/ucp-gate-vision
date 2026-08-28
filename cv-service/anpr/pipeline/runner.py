@@ -57,6 +57,7 @@ class PipelineRunner:
         ocr_min_confidence: float = 0.50,
         ocr_min_confidence_by_class: dict[str, float] | None = None,
         plate_pattern: re.Pattern | None = DEFAULT_PLATE_PATTERN,
+        min_plate_text_length: int = 6,
         source_video: str | None = None,
     ):
         self.vehicle_detector = vehicle_detector
@@ -100,6 +101,23 @@ class PipelineRunner:
         self.ocr_min_confidence = ocr_min_confidence
         self.ocr_min_confidence_by_class = ocr_min_confidence_by_class or {}
         self.plate_pattern = plate_pattern
+        # Reject a reading shorter than a real plate can be. Every one of the
+        # 32 plates in sample_data/ground_truth.csv is 6 or 7 characters, so a
+        # 5-character reading is a truncation, not a short plate.
+        #
+        # This is the fix for the one failure mode the confidence floor could
+        # not touch. Measured on the V2 benchmark's own events: four of its
+        # eight wrong reads were truncations at HIGH confidence -- LEE8980 read
+        # as "LEE18" at 0.9997, LEN9009 as "LEN08", LEN910 as "LEN18", AZE335
+        # as "AE335". No --ocr-min-conf setting removes those; a sweep from
+        # 0.50 to 0.99 left the correct count flat at 20/33. Requiring 6
+        # characters removes all four, taking wrong car reads to zero.
+        #
+        # Deliberately separate from plate_pattern rather than folded into the
+        # regex as a lookahead: it is independently meaningful, independently
+        # tunable, and gets its own rejection reason so a run's diagnostics can
+        # tell "wrong shape" from "truncated".
+        self.min_plate_text_length = min_plate_text_length
         self.source_video = source_video
 
         self._events: list[DetectionEvent] = []
@@ -291,6 +309,12 @@ class PipelineRunner:
         """
         if not candidates:
             return None, "no_text_recognized"
+
+        if self.min_plate_text_length > 0:
+            long_enough = [c for c in candidates if len(c.text) >= self.min_plate_text_length]
+            if not long_enough:
+                return None, "text_too_short"
+            candidates = long_enough
 
         if self.plate_pattern is not None:
             well_formed = [c for c in candidates if self.plate_pattern.match(c.text)]

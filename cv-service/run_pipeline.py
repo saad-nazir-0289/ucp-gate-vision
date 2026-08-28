@@ -142,6 +142,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "like '545' on its own shape — lower it if this is costing recall at your gate.",
     )
     p.add_argument(
+        "--min-plate-chars",
+        type=int,
+        default=DEFAULTS.min_plate_text_length,
+        help="Reject a plate reading shorter than this many characters. Every plate in "
+        "sample_data/ground_truth.csv is 6-7 chars, so a 5-char read is a truncation. Measured on "
+        "the V2 benchmark this removes four HIGH-confidence truncated misreads that no "
+        "--ocr-min-conf value could reach (LEE8980 read as 'LEE18' at 0.9997), taking wrong car "
+        "reads to zero. Set 0 to disable.",
+    )
+    p.add_argument(
         "--plate-pattern",
         default=None,
         help="Regex a candidate OCR reading must match to be accepted, overriding "
@@ -226,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
         ocr_min_confidence=args.ocr_min_conf,
         ocr_min_confidence_by_class=ocr_min_confidence_by_class,
         plate_pattern=plate_pattern,
+        min_plate_text_length=args.min_plate_chars,
         # Recorded into every event so scripts/score_accuracy.py matches
         # ground truth on the actual source video rather than inferring it
         # from the events-JSON filename — that inference silently scored a

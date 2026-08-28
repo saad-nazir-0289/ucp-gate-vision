@@ -248,3 +248,62 @@ class TestPlateCandidateSelection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMinimumPlateTextLength(unittest.TestCase):
+    """Regression tests for the truncated-read failure mode.
+
+    Four of the eight wrong reads in the V2 benchmark were truncations at
+    HIGH confidence, which no --ocr-min-conf value can remove: a sweep from
+    0.50 to 0.99 over that run's own events left the correct count flat at
+    20/33. Every plate in the ground truth is 6-7 characters.
+    """
+
+    def _run(self, ocr, **kwargs):
+        with tempfile.TemporaryDirectory() as evidence_dir:
+            runner = PipelineRunner(
+                vehicle_detector=FakeVehicleDetector(kwargs.pop("vehicle_class", "car")),
+                plate_detector=FakePlateDetector(),
+                plate_ocr=ocr,
+                tracker=ByteTrackTracker(fps=20.0),
+                evidence_dir=evidence_dir,
+                **kwargs,
+            )
+            runner._process_frame(_make_frame(), frame_idx=0)
+            for track in runner.tracker.finalize_all():
+                runner._finalize_track(track)
+            return runner._events, runner._reject_reasons
+
+    def test_high_confidence_truncated_read_is_rejected(self):
+        """The real case: LEE8980 read as 'LEE18' at 0.9997. It matches the
+        plate-format pattern and clears every confidence floor."""
+        events, reasons = self._run(FakeMultiCandidateOCR([PlateReading("LEE18", 0.9997, 1)]))
+        self.assertEqual(len(events), 0)
+        self.assertEqual(reasons["text_too_short"], 1)
+
+    def test_other_real_truncations_rejected(self):
+        for text, conf in (("LEN08", 0.8464), ("LEN18", 0.9980), ("AE335", 0.6652)):
+            with self.subTest(text=text):
+                events, _ = self._run(FakeMultiCandidateOCR([PlateReading(text, conf, 1)]))
+                self.assertEqual(len(events), 0, f"{text!r} is 5 chars; every real plate is 6-7")
+
+    def test_genuine_six_and_seven_char_plates_still_accepted(self):
+        for text in ("BUV711", "GAA545", "ARK2363", "LEE8980"):
+            with self.subTest(text=text):
+                events, _ = self._run(FakeMultiCandidateOCR([PlateReading(text, 0.99, 1)]))
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0].plate_text, text)
+
+    def test_can_be_disabled_for_deployments_with_shorter_plates(self):
+        events, _ = self._run(
+            FakeMultiCandidateOCR([PlateReading("AB12", 0.99, 1)]), min_plate_text_length=0
+        )
+        self.assertEqual(len(events), 1)
+
+    def test_length_rejection_is_distinct_from_format_rejection(self):
+        """Diagnostics must tell 'truncated' from 'wrong shape' -- they have
+        different fixes."""
+        _, short = self._run(FakeMultiCandidateOCR([PlateReading("LEE18", 0.99, 1)]))
+        _, bad = self._run(FakeMultiCandidateOCR([PlateReading("ENTRANCE", 0.99, 1)]))
+        self.assertEqual(short["text_too_short"], 1)
+        self.assertEqual(bad["format_mismatch"], 1)
