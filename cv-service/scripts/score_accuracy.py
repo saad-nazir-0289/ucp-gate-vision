@@ -614,6 +614,110 @@ def print_sweep(results: list[dict], run_floor: float | None) -> None:
     print()
 
 
+def plate_read_coverage(
+    gt_rows: list[GroundTruthRow], events: list[PipelineEvent], max_near_distance: int = 2
+) -> list[tuple[GroundTruthRow, str, list[PipelineEvent], int]]:
+    """Was each ground-truth plate read ANYWHERE in its clip, ignoring time?
+
+    FIX #12. This deliberately throws away timestamp matching, which makes it
+    useless as a score and invaluable as a diagnostic: it separates "OCR could
+    not read this plate" from "OCR read it fine and the matcher credited it to
+    the wrong row". Those are different bugs owned by different people, and the
+    headline accuracy number cannot distinguish them.
+
+    It found a real one. On the V2 benchmark the headline said 20/33 correct
+    (60.61%), while 24 of 33 plates had in fact been read EXACTLY right
+    somewhere in their own clip — four rows were lost purely to timestamp
+    matching, because ground-truth labels sit 2-6s later than the frame the
+    pipeline reads the plate on (a human labels when the vehicle reaches the
+    gate; the pipeline reads it on approach). Cars were 18/19 = 94.74% by
+    plate-read against a reported 84.21%.
+
+    Read the result as a CEILING, not a score: an exact hit here can be
+    coincidence (the same plate legitimately passing twice, or another
+    vehicle's plate read off a neighbouring crop), which is exactly why the
+    real scorer still matches on time. A large gap between this and the
+    headline is a signal to fix the ground truth, not to celebrate.
+
+    Returns (gt_row, verdict, matching_events, edit_distance) per row, where
+    verdict is "exact", "near" (within max_near_distance) or "absent".
+    """
+    by_file: dict[str, list[PipelineEvent]] = {}
+    for ev in events:
+        if ev.plate:
+            by_file.setdefault(ev.filename, []).append(ev)
+
+    out: list[tuple[GroundTruthRow, str, list[PipelineEvent], int]] = []
+    for gt in gt_rows:
+        if not gt.plate:
+            continue
+        candidates = by_file.get(gt.filename, [])
+        exact = [ev for ev in candidates if ev.plate == gt.plate]
+        if exact:
+            out.append((gt, "exact", exact, 0))
+            continue
+        scored = sorted(((edit_distance(gt.plate, ev.plate), i) for i, ev in enumerate(candidates)))
+        if scored and scored[0][0] <= max_near_distance:
+            dist, idx = scored[0]
+            out.append((gt, "near", [candidates[idx]], dist))
+        else:
+            out.append((gt, "absent", [], scored[0][0] if scored else -1))
+    return out
+
+
+def print_coverage(coverage, reported_correct: int) -> None:
+    print("=" * 78)
+    print("PLATE-READ COVERAGE (timestamp matching ignored)")
+    print("=" * 78)
+    print(
+        "Was each ground-truth plate read anywhere in its own clip, regardless of when?\n"
+        "This is a CEILING and a diagnostic, not a score -- it separates 'OCR could not\n"
+        "read this' from 'OCR read it and the matcher credited it elsewhere'. A big gap\n"
+        "against the headline means the ground-truth timestamps need fixing, not the model.\n"
+    )
+    for gt, verdict, evs, dist in coverage:
+        if verdict == "exact":
+            times = ", ".join(f"{e.timestamp_sec:.2f}s" for e in evs)
+            detail = f"read exactly at {times}"
+        elif verdict == "near":
+            e = evs[0]
+            detail = f"nearest {e.plate!r} (dist {dist}) at {e.timestamp_sec:.2f}s"
+        else:
+            detail = "never read"
+        print(f"  {verdict:<7} {gt.plate:<9} labeled {gt.timestamp_sec:>7.1f}s  {detail}")
+
+    total = len(coverage)
+    n_exact = sum(1 for c in coverage if c[1] == "exact")
+    n_near = sum(1 for c in coverage if c[1] == "near")
+    n_absent = sum(1 for c in coverage if c[1] == "absent")
+    print()
+    print(f"  read exactly somewhere in the clip : {n_exact:>3}/{total}  ({_pct(n_exact, total):.2f}%)")
+    print(f"  read within a couple of characters : {n_near:>3}/{total}  ({_pct(n_near, total):.2f}%)")
+    print(f"  never read at all                  : {n_absent:>3}/{total}  ({_pct(n_absent, total):.2f}%)")
+    gap = n_exact - reported_correct
+    print(f"\n  headline score credits {reported_correct}; {n_exact} were actually read exactly.")
+    if gap > 0:
+        print(
+            f"  {gap} row(s) lost to timestamp matching -- the plate was read correctly but\n"
+            f"  credited to a different row or dropped. Check the label times before\n"
+            f"  concluding anything about the model, and try a wider --time-window."
+        )
+    elif gap < 0:
+        print(f"  headline exceeds exact reads by {-gap}: matching is crediting rows this view cannot confirm.")
+    print()
+
+    by_type: dict[str, list[int]] = {}
+    for gt, verdict, _, _ in coverage:
+        b = by_type.setdefault(gt.vehicle_type, [0, 0])
+        b[1] += 1
+        if verdict == "exact":
+            b[0] += 1
+    print("  By vehicle type (exact reads):")
+    for t, (n, tot) in sorted(by_type.items()):
+        print(f"    {t:<6} {n:>3}/{tot}  ({_pct(n, tot):.2f}%)")
+    print()
+
+
 def find_duplicate_events(
     events: list[PipelineEvent], window_sec: float = 5.0, max_near_edit_distance: int = 1
 ) -> tuple[list[tuple[PipelineEvent, PipelineEvent]], list[tuple[PipelineEvent, PipelineEvent]]]:
@@ -1084,6 +1188,13 @@ def main(argv: list[str] | None = None) -> int:
         "--run-ocr-min-conf", type=float, default=None,
         help="The --ocr-min-conf the run used, so the sweep can mark thresholds it cannot simulate.",
     )
+    parser.add_argument(
+        "--coverage", action="store_true",
+        help="Report whether each ground-truth plate was read ANYWHERE in its clip, ignoring "
+        "timestamps. A diagnostic ceiling, not a score: it separates 'OCR could not read this' "
+        "from 'OCR read it and the matcher credited it elsewhere'. A large gap against the "
+        "headline means the ground-truth timestamps need fixing.",
+    )
     parser.add_argument("--results-csv", type=Path, default=None, help="Default: <output-dir>/accuracy_results.csv")
     parser.add_argument("--report", type=Path, default=None, help="Optional path to write a markdown report, e.g. docs/ACCURACY_REPORT.md")
     args = parser.parse_args(argv)
@@ -1131,6 +1242,12 @@ def main(argv: list[str] | None = None) -> int:
             gt.ambiguous = False
         assignments = match_events_to_ground_truth(gt_rows, events, args.time_window)
         rows = score(gt_rows, events, assignments)
+
+    if args.coverage:
+        print_coverage(
+            plate_read_coverage(gt_rows, events),
+            sum(1 for r in rows if r.scorable and r.result == "Correct"),
+        )
 
     results_csv = args.results_csv or (args.output_dir / "accuracy_results.csv")
     write_results_csv(rows, results_csv, find_timestamp_discrepancies(gt_rows, events, assignments))
